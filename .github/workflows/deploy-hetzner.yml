@@ -36,16 +36,15 @@ on:
       GHCR_TOKEN:
         required: false
 
-concurrency:
-  group: ${{ inputs.concurrency-group }}
-  cancel-in-progress: true
-
 env:
   REGISTRY: ghcr.io
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ inputs.concurrency-group }}
+      cancel-in-progress: true
     permissions:
       contents: read
       packages: write
