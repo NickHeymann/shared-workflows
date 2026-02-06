@@ -26,10 +26,6 @@ on:
         required: false
         type: string
         default: ''
-      concurrency-group:
-        description: 'Concurrency group name for this deployment'
-        required: true
-        type: string
 
 env:
   REGISTRY: ghcr.io
@@ -37,9 +33,6 @@ env:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    concurrency:
-      group: ${{ inputs.concurrency-group }}
-      cancel-in-progress: true
     permissions:
       contents: read
       packages: write
