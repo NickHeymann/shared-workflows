@@ -1,5 +1,8 @@
 name: Deploy to Hetzner (GHCR)
 
+# NOTE: All inputs are trusted (from caller YAML, not user input).
+# Do NOT pass untrusted data (PR titles, branch names, etc.) as inputs.
+
 on:
   workflow_call:
     inputs:
@@ -64,7 +67,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Deploy to Hetzner
-        uses: appleboy/ssh-action@v1.0.0
+        uses: appleboy/ssh-action@v1.2.5
         env:
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
         with:
@@ -72,13 +75,14 @@ jobs:
           username: root
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           envs: GHCR_TOKEN
+          timeout: 30s
           command_timeout: 15m
           script: |
-            # Login to GHCR
+            set -euo pipefail
+
             echo "$GHCR_TOKEN" | docker login ghcr.io -u nickheymann --password-stdin
 
-            # Deploy primary path
-            cd ${{ inputs.deploy-path }}
+            cd "${{ inputs.deploy-path }}"
             docker compose pull
 
             # Pre-deploy commands (e.g. migrations before up)
@@ -86,13 +90,14 @@ jobs:
 
             docker compose up -d --force-recreate
 
-            # Post-deploy commands (migrations, cache, etc.)
+            # Post-deploy commands (cache, health check, etc.)
             ${{ inputs.post-deploy-commands }}
 
             # Deploy extra paths (e.g. staging) if specified
             EXTRA_PATHS="${{ inputs.extra-deploy-paths }}"
             if [ -n "$EXTRA_PATHS" ]; then
               echo "$EXTRA_PATHS" | while IFS= read -r path; do
+                path=$(echo "$path" | xargs)
                 if [ -n "$path" ]; then
                   echo "Deploying to extra path: $path"
                   cd "$path"
@@ -102,5 +107,5 @@ jobs:
               done
             fi
 
-            # Cleanup old images
-            docker image prune -f
+            # Cleanup old images (skip recently used to avoid race with concurrent deploys)
+            docker image prune -f --filter "until=1h"
