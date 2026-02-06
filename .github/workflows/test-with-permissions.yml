@@ -1,0 +1,27 @@
+name: Test With Permissions
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        required: true
+        type: string
+      deploy-path:
+        required: true
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Echo inputs
+        run: |
+          echo "Image: ${{ inputs.image-name }}"
+          echo "Path: ${{ inputs.deploy-path }}"
+          echo "Registry: $REGISTRY"
