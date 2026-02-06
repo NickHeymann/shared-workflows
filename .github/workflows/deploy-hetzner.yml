@@ -16,8 +16,13 @@ on:
         required: false
         type: string
         default: '.'
+      pre-deploy-commands:
+        description: 'Commands to run after pull but before docker compose up (e.g. migrations)'
+        required: false
+        type: string
+        default: ''
       post-deploy-commands:
-        description: 'Commands to run after docker compose up (e.g. migrations, cache)'
+        description: 'Commands to run after docker compose up (e.g. cache, health check)'
         required: false
         type: string
         default: ''
@@ -75,6 +80,10 @@ jobs:
             # Deploy primary path
             cd ${{ inputs.deploy-path }}
             docker compose pull
+
+            # Pre-deploy commands (e.g. migrations before up)
+            ${{ inputs.pre-deploy-commands }}
+
             docker compose up -d --force-recreate
 
             # Post-deploy commands (migrations, cache, etc.)
