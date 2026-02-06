@@ -1,0 +1,19 @@
+name: Test Perms Workflow Level
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Echo
+        run: echo "Image ${{ inputs.image-name }}"
