@@ -30,11 +30,6 @@ on:
         description: 'Concurrency group name for this deployment'
         required: true
         type: string
-    secrets:
-      SSH_PRIVATE_KEY:
-        required: true
-      GHCR_TOKEN:
-        required: false
 
 env:
   REGISTRY: ghcr.io
