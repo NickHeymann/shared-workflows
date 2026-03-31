@@ -34,12 +34,137 @@ on:
         required: false
         type: string
         default: ''
+      app-container:
+        description: 'App container name for quick deploy (e.g. kathrin-coaching-app). If set, enables quick deploy for view/css/js changes.'
+        required: false
+        type: string
+        default: ''
+      public-volume-path:
+        description: 'Host path to public volume for quick deploy (e.g. /mnt/HC_Volume.../app-public/_data)'
+        required: false
+        type: string
+        default: ''
 
 env:
   REGISTRY: ghcr.io
 
 jobs:
-  build-and-deploy:
+  # ── Detect whether a quick deploy is possible ────────────────────────────────
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      quick: ${{ steps.check.outputs.quick }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Check changed files
+        id: check
+        run: |
+          CHANGED=$(git diff --name-only HEAD~1 HEAD)
+          echo "Changed files:"
+          echo "$CHANGED"
+
+          # Quick deploy only possible if app-container is configured
+          if [ -z "${{ inputs.app-container }}" ]; then
+            echo "quick=false" >> "$GITHUB_OUTPUT"
+            echo "Quick deploy disabled (no app-container configured)"
+            exit 0
+          fi
+
+          # Full rebuild required for these file types
+          FULL_PATTERN="^(Dockerfile|composer\.(json|lock)|package(-lock)?\.json|vite\.config\.[jt]s|tailwind\.config\.[jt]s|\.github/|app/|config/|database/|routes/|bootstrap/)"
+
+          NEEDS_FULL=false
+          while IFS= read -r file; do
+            if echo "$file" | grep -qE "$FULL_PATTERN"; then
+              NEEDS_FULL=true
+              echo "Full build required due to: $file"
+              break
+            fi
+          done <<< "$CHANGED"
+
+          if [ "$NEEDS_FULL" = "false" ]; then
+            echo "quick=true" >> "$GITHUB_OUTPUT"
+            echo "Quick deploy (views/css/js/public only)"
+          else
+            echo "quick=false" >> "$GITHUB_OUTPUT"
+            echo "Full Docker build required"
+          fi
+
+  # ── Quick Deploy: rsync views + assets directly into container ───────────────
+  quick-deploy:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.quick == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node & build assets
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci && npm run build
+
+      - name: Create staging dir on server
+        uses: appleboy/ssh-action@v1.2.5
+        with:
+          host: 46.224.6.69
+          username: root
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          timeout: 30s
+          command_timeout: 2m
+          script: mkdir -p /tmp/quick-deploy/resources/views /tmp/quick-deploy/public/build
+
+      - name: Upload views
+        uses: burnett01/rsync-deployments@7.0.1
+        with:
+          switches: -az --delete
+          path: resources/views/
+          remote_path: /tmp/quick-deploy/resources/views/
+          remote_host: 46.224.6.69
+          remote_user: root
+          remote_key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Upload built assets
+        uses: burnett01/rsync-deployments@7.0.1
+        with:
+          switches: -az --delete
+          path: public/build/
+          remote_path: /tmp/quick-deploy/public/build/
+          remote_host: 46.224.6.69
+          remote_user: root
+          remote_key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Apply + clear caches
+        uses: appleboy/ssh-action@v1.2.5
+        with:
+          host: 46.224.6.69
+          username: root
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          timeout: 30s
+          command_timeout: 5m
+          script: |
+            set -e
+            CONTAINER="${{ inputs.app-container }}"
+            VOLUME="${{ inputs.public-volume-path }}"
+
+            docker cp /tmp/quick-deploy/resources/views/. "$CONTAINER":/var/www/resources/views/
+            if [ -n "$VOLUME" ]; then
+              cp -r /tmp/quick-deploy/public/build/. "$VOLUME/build/"
+            fi
+            docker exec "$CONTAINER" php artisan view:clear
+            docker exec "$CONTAINER" php artisan cache:clear
+            rm -rf /tmp/quick-deploy
+            echo "Quick deploy done"
+
+  # ── Full Deploy: Docker build + push + restart ───────────────────────────────
+  full-deploy:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.quick == 'false'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
