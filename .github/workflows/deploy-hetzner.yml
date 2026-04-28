@@ -157,6 +157,7 @@ jobs:
               cp -r /tmp/quick-deploy/public/build/. "$VOLUME/build/"
             fi
             docker exec "$CONTAINER" php artisan view:clear
+            docker exec "$CONTAINER" php artisan config:clear
             docker exec "$CONTAINER" php artisan cache:clear
             rm -rf /tmp/quick-deploy
             echo "Quick deploy done"
