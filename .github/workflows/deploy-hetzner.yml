@@ -159,6 +159,14 @@ jobs:
             docker exec "$CONTAINER" php artisan view:clear
             docker exec "$CONTAINER" php artisan config:clear
             docker exec "$CONTAINER" php artisan cache:clear
+
+            # OPcache reset — many of our images run with
+            # opcache.validate_timestamps=Off, so freshly compiled views
+            # would otherwise be ignored until the next container restart.
+            # USR2 to PID 1 = PHP-FPM graceful reload (fresh OPcache).
+            docker exec --user root "$CONTAINER" kill -USR2 1 || \
+              echo "WARN: USR2 failed; consider docker compose restart on next deploy"
+
             rm -rf /tmp/quick-deploy
             echo "Quick deploy done"
 
