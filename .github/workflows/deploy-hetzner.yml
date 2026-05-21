@@ -117,7 +117,7 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           timeout: 30s
           command_timeout: 2m
-          script: mkdir -p /tmp/quick-deploy/resources/views /tmp/quick-deploy/public/build
+          script: mkdir -p /tmp/quick-deploy/resources/views /tmp/quick-deploy/public/build /tmp/quick-deploy/public/images
 
       - name: Upload views
         uses: burnett01/rsync-deployments@7.0.1
@@ -139,6 +139,18 @@ jobs:
           remote_user: root
           remote_key: ${{ secrets.SSH_PRIVATE_KEY }}
 
+      # public/images/ — additive sync (NO --delete: images may also be
+      # uploaded via admin/CMS at runtime; we must not wipe those).
+      - name: Upload public images
+        uses: burnett01/rsync-deployments@7.0.1
+        with:
+          switches: -az
+          path: public/images/
+          remote_path: /tmp/quick-deploy/public/images/
+          remote_host: 46.224.6.69
+          remote_user: root
+          remote_key: ${{ secrets.SSH_PRIVATE_KEY }}
+
       - name: Apply + clear caches
         uses: appleboy/ssh-action@v1.2.5
         with:
@@ -155,6 +167,16 @@ jobs:
             docker cp /tmp/quick-deploy/resources/views/. "$CONTAINER":/var/www/resources/views/
             if [ -n "$VOLUME" ]; then
               cp -r /tmp/quick-deploy/public/build/. "$VOLUME/build/"
+              # public/images/ — additive copy into the public volume so new
+              # static images (e.g. /images/about/foo.jpg) reach nginx without
+              # a full Docker rebuild. www-data inside the container is uid 82.
+              if [ -d /tmp/quick-deploy/public/images ]; then
+                mkdir -p "$VOLUME/images"
+                cp -r /tmp/quick-deploy/public/images/. "$VOLUME/images/"
+                chown -R 82:82 "$VOLUME/images"
+                find "$VOLUME/images" -type d -exec chmod 755 {} \;
+                find "$VOLUME/images" -type f -exec chmod 644 {} \;
+              fi
             fi
             docker exec "$CONTAINER" php artisan view:clear
             docker exec "$CONTAINER" php artisan config:clear
