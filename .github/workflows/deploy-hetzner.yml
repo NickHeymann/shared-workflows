@@ -101,6 +101,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # vendor/ wird zur Vite-Build-Zeit gebraucht: app.js importiert Livewire+Alpine
+      # aus vendor/livewire/livewire/dist/livewire.esm. Ohne composer install scheitert
+      # der Build mit "Could not resolve '../../vendor/livewire/livewire/dist/livewire.esm'".
+      - name: Setup PHP & install composer deps
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          coverage: none
+      - run: composer install --no-dev --no-interaction --prefer-dist --no-progress --no-scripts
+
       - name: Setup Node & build assets
         uses: actions/setup-node@v4
         with:
