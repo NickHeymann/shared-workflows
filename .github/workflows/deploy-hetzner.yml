@@ -44,6 +44,11 @@ on:
         required: false
         type: string
         default: ''
+      runner:
+        description: 'Runner label(s) for build/deploy jobs. Default ubuntu-latest (GitHub-hosted). Set to self-hosted to use the Hetzner runner and avoid Actions minutes.'
+        required: false
+        type: string
+        default: 'ubuntu-latest'
 
 env:
   REGISTRY: ghcr.io
@@ -51,7 +56,7 @@ env:
 jobs:
   # ── Detect whether a quick deploy is possible ────────────────────────────────
   detect-changes:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     outputs:
       quick: ${{ steps.check.outputs.quick }}
     steps:
@@ -97,7 +102,7 @@ jobs:
   quick-deploy:
     needs: detect-changes
     if: needs.detect-changes.outputs.quick == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     steps:
       - uses: actions/checkout@v4
 
@@ -206,7 +211,7 @@ jobs:
   full-deploy:
     needs: detect-changes
     if: needs.detect-changes.outputs.quick == 'false'
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
