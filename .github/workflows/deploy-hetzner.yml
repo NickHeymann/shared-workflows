@@ -106,23 +106,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # vendor/ wird zur Vite-Build-Zeit gebraucht: app.js importiert Livewire+Alpine
-      # aus vendor/livewire/livewire/dist/livewire.esm. Ohne composer install scheitert
-      # der Build mit "Could not resolve '../../vendor/livewire/livewire/dist/livewire.esm'".
-      - name: Setup PHP & install composer deps
-        uses: shivammathur/setup-php@v2
-        with:
-          php-version: '8.4'
-          coverage: none
-      - run: composer install --no-dev --no-interaction --prefer-dist --no-progress --no-scripts
-
-      - name: Setup Node & build assets
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-
-      - run: npm ci && npm run build
+      # Install PHP + Node inline rather than via shivammathur/setup-php +
+      # actions/setup-node: those marketplace actions cannot provision a runtime
+      # on the lean self-hosted runner ("Could not setup PHP 8.4"). The runner
+      # image is Debian-based, so apt + NodeSource work directly.
+      # vendor/ is needed at Vite-build time: app.js imports Livewire+Alpine from
+      # vendor/livewire/livewire/dist/livewire.esm.
+      - name: Setup PHP + Node + build assets
+        run: |
+          if ! command -v php >/dev/null 2>&1; then
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends \
+              php8.4-cli php8.4-xml php8.4-mbstring php8.4-zip php8.4-intl php8.4-bcmath php8.4-curl \
+              unzip git curl ca-certificates >/dev/null 2>&1 \
+            || apt-get install -y -qq --no-install-recommends php-cli php-xml php-mbstring php-zip php-intl php-bcmath php-curl unzip git curl ca-certificates >/dev/null 2>&1
+          fi
+          if ! command -v composer >/dev/null 2>&1; then
+            curl -sS https://getcomposer.org/installer -o /tmp/composer-setup.php
+            HASH="$(curl -sS https://composer.github.io/installer.sig)"
+            php -r "if (hash_file('sha384','/tmp/composer-setup.php') !== '$HASH') { exit(1); }"
+            php /tmp/composer-setup.php --install-dir=/usr/local/bin --filename=composer
+          fi
+          if ! command -v node >/dev/null 2>&1; then
+            curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1
+            apt-get install -y -qq nodejs >/dev/null 2>&1
+          fi
+          composer install --no-dev --no-interaction --prefer-dist --no-progress --no-scripts --ignore-platform-reqs
+          npm ci && npm run build
 
       - name: Create staging dir on server
         uses: appleboy/ssh-action@v1.2.5
