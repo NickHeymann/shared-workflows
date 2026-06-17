@@ -45,10 +45,10 @@ on:
         type: string
         default: ''
       runner:
-        description: 'Runner label(s) for build/deploy jobs. Default ubuntu-latest (GitHub-hosted). Set to self-hosted to use the Hetzner runner and avoid Actions minutes.'
+        description: 'Runner label(s) for build/deploy jobs. Default self-hosted (Hetzner runner, no GitHub Actions minutes). Override to ubuntu-latest only if a repo has no self-hosted runner provisioned.'
         required: false
         type: string
-        default: 'ubuntu-latest'
+        default: 'self-hosted'
 
 env:
   REGISTRY: ghcr.io
