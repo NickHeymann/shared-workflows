@@ -247,8 +247,14 @@ jobs:
           tags: |
             ghcr.io/${{ inputs.image-name }}:latest
             ghcr.io/${{ inputs.image-name }}:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Cache via a per-image GHCR tag, NOT type=gha. On the self-hosted
+          # Hetzner runner type=gha round-trips every layer (mode=max) to
+          # GitHub's cache service over the public internet — slow, and wasteful
+          # since the runner builds on the same host it deploys to. A registry
+          # cache tag lives in GHCR (local network for the runner) and is pulled
+          # layer-by-layer, so an unchanged base/deps stage is reused instantly.
+          cache-from: type=registry,ref=ghcr.io/${{ inputs.image-name }}:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ inputs.image-name }}:buildcache,mode=max
 
       - name: Deploy to Hetzner
         uses: appleboy/ssh-action@v1.2.5
