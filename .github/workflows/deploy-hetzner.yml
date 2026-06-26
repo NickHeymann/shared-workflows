@@ -229,15 +229,24 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # NOTE: no docker/setup-buildx-action here on purpose. We reuse a
-      # long-lived docker-container builder that already lives on the Hetzner
-      # host (created once: `docker buildx create --name hetzner-persistent
-      # --driver docker-container --bootstrap`). setup-buildx-action with
-      # driver:docker-container would create a NEW per-run builder (empty cache)
-      # and clean it up at job end. Instead we point build-push-action at the
-      # existing builder via its `builder:` input below, so its BuildKit state +
-      # layer cache + RUN --mount=type=cache caches persist in a local volume
-      # between jobs and across repos — no GHCR cache round-trip needed.
+      # Reuse a long-lived docker-container builder instead of a per-run one.
+      # The builder's BuildKit container + cache live in a host Docker volume
+      # (buildx_buildkit_hetzner-persistent0_state) that persists BETWEEN jobs
+      # and across repos — so an unchanged base/deps stage + RUN --mount=type=
+      # cache caches are reused instantly, with NO GHCR cache round-trip.
+      #
+      # buildx builder *instances* are client-side (~/.docker/buildx), and the
+      # self-hosted runner's home is wiped per job, so the instance reference
+      # isn't there even though the builder's state volume is. We (re)create the
+      # instance each run with the SAME name: because the docker-container state
+      # volume already exists on the host, this reattaches to it (cache intact)
+      # rather than building a fresh empty builder. `|| true` makes it idempotent.
+      - name: Ensure persistent buildx builder
+        run: |
+          docker buildx create --name hetzner-persistent \
+            --driver docker-container --bootstrap 2>/dev/null \
+            || docker buildx inspect hetzner-persistent --bootstrap
+          docker buildx ls
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
