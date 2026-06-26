@@ -229,8 +229,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      # NOTE: no docker/setup-buildx-action here on purpose. We reuse a
+      # long-lived docker-container builder that already lives on the Hetzner
+      # host (created once: `docker buildx create --name hetzner-persistent
+      # --driver docker-container --bootstrap`). setup-buildx-action with
+      # driver:docker-container would create a NEW per-run builder (empty cache)
+      # and clean it up at job end. Instead we point build-push-action at the
+      # existing builder via its `builder:` input below, so its BuildKit state +
+      # layer cache + RUN --mount=type=cache caches persist in a local volume
+      # between jobs and across repos — no GHCR cache round-trip needed.
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -242,19 +249,17 @@ jobs:
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
+          # Build on the pre-existing persistent host builder (see note above).
+          builder: hetzner-persistent
           context: ${{ inputs.docker-context }}
           push: true
           tags: |
             ghcr.io/${{ inputs.image-name }}:latest
             ghcr.io/${{ inputs.image-name }}:${{ github.sha }}
-          # Cache via a per-image GHCR tag, NOT type=gha. On the self-hosted
-          # Hetzner runner type=gha round-trips every layer (mode=max) to
-          # GitHub's cache service over the public internet — slow, and wasteful
-          # since the runner builds on the same host it deploys to. A registry
-          # cache tag lives in GHCR (local network for the runner) and is pulled
-          # layer-by-layer, so an unchanged base/deps stage is reused instantly.
-          cache-from: type=registry,ref=ghcr.io/${{ inputs.image-name }}:buildcache
-          cache-to: type=registry,ref=ghcr.io/${{ inputs.image-name }}:buildcache,mode=max
+          # No cache-from/to: the persistent docker-container builder above keeps
+          # its full layer cache + RUN --mount=type=cache caches in its local
+          # state volume between jobs. That is strictly faster than the previous
+          # type=registry GHCR round-trip and needs no cache push/pull at all.
 
       - name: Deploy to Hetzner
         uses: appleboy/ssh-action@v1.2.5
