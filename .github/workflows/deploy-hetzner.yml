@@ -145,7 +145,7 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           timeout: 30s
           command_timeout: 2m
-          script: mkdir -p /tmp/quick-deploy/resources/views /tmp/quick-deploy/public/build /tmp/quick-deploy/public/images
+          script: mkdir -p /tmp/quick-deploy/resources/views /tmp/quick-deploy/lang /tmp/quick-deploy/public/build /tmp/quick-deploy/public/images
 
       - name: Upload views
         uses: burnett01/rsync-deployments@7.0.1
@@ -153,6 +153,32 @@ jobs:
           switches: -az --delete
           path: resources/views/
           remote_path: /tmp/quick-deploy/resources/views/
+          remote_host: 46.224.6.69
+          remote_user: root
+          remote_key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      # lang/ — translation files (lang/de/*.php, lang/en/*.php). Same class as
+      # views: no code, no CMS input, so --delete is safe. Without this, text
+      # changes in lang/ are classified as quick-deployable but never reach the
+      # container (they only land on the next full image build).
+      # Only some projects have a lang/ dir — guard so projects without one
+      # (most) don't fail the rsync step on a missing source path.
+      - name: Check for lang directory
+        id: has-lang
+        run: |
+          if [ -d lang ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload lang
+        if: steps.has-lang.outputs.exists == 'true'
+        uses: burnett01/rsync-deployments@7.0.1
+        with:
+          switches: -az --delete
+          path: lang/
+          remote_path: /tmp/quick-deploy/lang/
           remote_host: 46.224.6.69
           remote_user: root
           remote_key: ${{ secrets.SSH_PRIVATE_KEY }}
@@ -193,6 +219,9 @@ jobs:
             VOLUME="${{ inputs.public-volume-path }}"
 
             docker cp /tmp/quick-deploy/resources/views/. "$CONTAINER":/var/www/resources/views/
+            if [ -d /tmp/quick-deploy/lang ]; then
+              docker cp /tmp/quick-deploy/lang/. "$CONTAINER":/var/www/lang/
+            fi
             if [ -n "$VOLUME" ]; then
               cp -r /tmp/quick-deploy/public/build/. "$VOLUME/build/"
               # public/images/ — additive copy into the public volume so new
