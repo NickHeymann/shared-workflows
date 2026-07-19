@@ -44,6 +44,11 @@ on:
         required: false
         type: string
         default: ''
+      opcache-reset-url:
+        description: 'Optional URL to reset FPM OPcache after a quick deploy (e.g. https://app.example.com/__deploy/opcache-reset). REQUIRED when the container runs opcache.validate_timestamps=Off, otherwise freshly copied Blade views stay stale in FPM until the next container restart. The app must expose a token-guarded route calling opcache_reset(); pass the token via the DEPLOY_TOKEN secret. If empty, only kill -USR2 is attempted.'
+        required: false
+        type: string
+        default: ''
       runner:
         description: 'Runner label(s) for build/deploy jobs. Default self-hosted (Hetzner runner, no GitHub Actions minutes). Override to ubuntu-latest only if a repo has no self-hosted runner provisioned.'
         required: false
@@ -207,10 +212,16 @@ jobs:
 
       - name: Apply + clear caches
         uses: appleboy/ssh-action@v1.2.5
+        env:
+          OPCACHE_RESET_URL: ${{ inputs.opcache-reset-url }}
+          DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
         with:
           host: 46.224.6.69
           username: root
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          # OPCACHE_RESET_URL + DEPLOY_TOKEN via envs (NOT interpolated into the
+          # script string) so the token never lands in the command line / logs.
+          envs: OPCACHE_RESET_URL,DEPLOY_TOKEN
           timeout: 30s
           command_timeout: 5m
           script: |
@@ -238,13 +249,37 @@ jobs:
             docker exec "$CONTAINER" php artisan view:clear
             docker exec "$CONTAINER" php artisan config:clear
             docker exec "$CONTAINER" php artisan cache:clear
+            # Views auf Disk neu kompilieren, damit der erste echte Request nicht
+            # gegen einen leeren Cache läuft (und der OPcache-Reset unten sofort
+            # den frischen Stand cachen kann).
+            docker exec "$CONTAINER" php artisan view:cache || true
 
-            # OPcache reset — many of our images run with
-            # opcache.validate_timestamps=Off, so freshly compiled views
-            # would otherwise be ignored until the next container restart.
-            # USR2 to PID 1 = PHP-FPM graceful reload (fresh OPcache).
-            docker exec --user root "$CONTAINER" kill -USR2 1 || \
-              echo "WARN: USR2 failed; consider docker compose restart on next deploy"
+            # ── OPcache-Reset ──────────────────────────────────────────────────
+            # Diese Images laufen mit opcache.validate_timestamps=Off: der FPM
+            # behält kompilierte Blade-Views im RAM, bis der OPcache explizit
+            # zurückgesetzt wird. `view:clear` (Disk) UND `kill -USR2` reichen NICHT
+            # zuverlässig — ohne echten Reset serviert der Container nach einem
+            # Quick-Deploy weiter den ALTEN Stand bis zum nächsten Container-Restart.
+            # Zuverlässig: HTTP-Request auf eine token-geschützte Route, die
+            # opcache_reset() im FPM-Worker-Kontext aufruft (CLI-opcache_reset wirkt
+            # nicht auf FPM). kill -USR2 bleibt als Fallback, wenn keine URL gesetzt.
+            RESET_OK=0
+            if [ -n "$OPCACHE_RESET_URL" ] && [ -n "$DEPLOY_TOKEN" ]; then
+              CODE=$(curl -s -o /tmp/opcache-reset.out -w "%{http_code}" \
+                --max-time 15 "${OPCACHE_RESET_URL}?token=${DEPLOY_TOKEN}" || echo "000")
+              if [ "$CODE" = "200" ]; then
+                echo "OPcache reset via HTTP ok: $(cat /tmp/opcache-reset.out)"
+                RESET_OK=1
+              else
+                echo "WARN: OPcache-Reset-URL antwortete HTTP $CODE (Route/Token prüfen)"
+              fi
+              rm -f /tmp/opcache-reset.out
+            fi
+            if [ "$RESET_OK" = "0" ]; then
+              echo "Fallback: kill -USR2 an FPM-Master"
+              docker exec --user root "$CONTAINER" kill -USR2 1 \
+                || echo "WARN: USR2 failed; consider docker compose restart"
+            fi
 
             rm -rf /tmp/quick-deploy
             echo "Quick deploy done"
