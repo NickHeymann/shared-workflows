@@ -265,8 +265,11 @@ jobs:
             # nicht auf FPM). kill -USR2 bleibt als Fallback, wenn keine URL gesetzt.
             RESET_OK=0
             if [ -n "$OPCACHE_RESET_URL" ] && [ -n "$DEPLOY_TOKEN" ]; then
+              # Token per Header (nicht als Query-String → landet nicht in
+              # nginx-/Proxy-Access-Logs). -H via env, nicht ins URL interpoliert.
               CODE=$(curl -s -o /tmp/opcache-reset.out -w "%{http_code}" \
-                --max-time 15 "${OPCACHE_RESET_URL}?token=${DEPLOY_TOKEN}" || echo "000")
+                --max-time 15 -H "X-Deploy-Token: ${DEPLOY_TOKEN}" \
+                "${OPCACHE_RESET_URL}" || echo "000")
               if [ "$CODE" = "200" ]; then
                 echo "OPcache reset via HTTP ok: $(cat /tmp/opcache-reset.out)"
                 RESET_OK=1
