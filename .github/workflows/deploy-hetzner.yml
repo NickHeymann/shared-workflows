@@ -123,57 +123,38 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive
           apt-get update -qq
 
-          # Nur akzeptieren wenn eine vorhandene php-Installation bereits >= 8.2
-          # ist (moderne Laravel/Statamic-Projekte brauchen mind. 8.2). Vorher
-          # wurde per `command -v php` nur "irgendein php" geprueft -- das hat
-          # den Ubuntu-Focal-Standard PHP 7.4 durchgewunken (der Runner-Container
-          # ist NICHT ephemeral, ein frueher fehlgeschlagener Lauf konnte 7.4
-          # ueber den ungepinnten Fallback unten dauerhaft installiert lassen)
-          # und composer install ist mit "Refusing to parse phar on PHP < 8.0"
-          # abgeschossen.
-          PHP_OK=false
-          if command -v php >/dev/null 2>&1 \
-            && php -r 'exit(version_compare(PHP_VERSION, "8.2.0", ">=") ? 0 : 1);'; then
-            PHP_OK=true
-          fi
-          if [ "$PHP_OK" = false ]; then
-            # Ubuntu Focal (Basis des Runner-Images) hat in den Standard-Repos
-            # nur PHP 7.4 -- 8.x braucht Ondrej Surys Zusatz-Repo. Deshalb NIE
-            # auf das ungepinnte "php-cli"-Metapaket ausweichen (zieht sonst
-            # stillschweigend die uralte Focal-Version).
-            apt-get install -y -qq --no-install-recommends ca-certificates curl gnupg lsb-release
-            curl -sS https://packages.sury.org/php/apt.gpg -o /usr/share/keyrings/deb-sury-php.gpg
-            echo "deb [signed-by=/usr/share/keyrings/deb-sury-php.gpg] https://packages.sury.org/php/ $(lsb_release -sc) main" \
-              > /etc/apt/sources.list.d/ondrej-php.list
+          # composer install laeuft in einem echten php:8.4-cli-Container,
+          # NICHT per apt auf dem Runner-Host. Grund: der Runner-Host ist
+          # Ubuntu 20.04 Focal (EOL) und bietet in den Standard-Repos nur
+          # PHP 7.4 -- composer install brach damit mit "Refusing to parse
+          # phar on PHP < 8.0" ab. Ein zwischenzeitlicher Versuch mit Ondrej
+          # Surys PPA/Sury-Repo ist ebenfalls gescheitert: Sury bedient nur
+          # Debian, und die Launchpad-PPA (ppa:ondrej/php) liefert fuer
+          # "focal" nur noch die InRelease-Metadatei, die eigentliche
+          # Packages-Datei 404et (Support fuer Focal eingestellt), beides
+          # live verifiziert am 2026-09-07. Der Tests-Job dieses Workflows
+          # loest exakt dasselbe Problem schon erfolgreich ueber
+          # `container: image: php:8.4-cli` -- hier dieselbe Idee, nur als
+          # einzelner `docker run`-Schritt statt Job-Container, weil
+          # spaetere Schritte (SSH-Deploy) auf dem Host laufen muessen.
+          docker run --rm -v "$PWD":/app -w /app php:8.4-cli sh -c '
+            set -e
+            export DEBIAN_FRONTEND=noninteractive
             apt-get update -qq
-            apt-get install -y -qq --no-install-recommends \
-              php8.4-cli php8.4-xml php8.4-mbstring php8.4-zip php8.4-intl php8.4-bcmath php8.4-curl \
-              unzip git \
-            || apt-get install -y -qq --no-install-recommends \
-              php8.3-cli php8.3-xml php8.3-mbstring php8.3-zip php8.3-intl php8.3-bcmath php8.3-curl \
-              unzip git \
-            || { echo "::error::Weder PHP 8.4 noch 8.3 ueber das Ondrej-Repo installierbar."; exit 1; }
-            # Mehrere php-Versionen koennen im Container koexistieren (z.B. ein
-            # altes 7.4 aus einem frueheren Lauf) -- den frisch installierten
-            # Alias explizit als "php" aktivieren statt update-alternatives'
-            # Default zu vertrauen.
-            NEWPHP="$(command -v php8.4 || command -v php8.3)"
-            update-alternatives --set php "$NEWPHP" 2>/dev/null || ln -sf "$NEWPHP" /usr/local/bin/php
-            php -r 'exit(version_compare(PHP_VERSION, "8.2.0", ">=") ? 0 : 1);' \
-              || { echo "::error::php zeigt nach der Installation immer noch auf < 8.2."; exit 1; }
-          fi
-          if ! command -v composer >/dev/null 2>&1; then
+            apt-get install -y -qq --no-install-recommends unzip git ca-certificates curl >/dev/null
             curl -sS https://getcomposer.org/installer -o /tmp/composer-setup.php
             HASH="$(curl -sS https://composer.github.io/installer.sig)"
-            php -r "if (hash_file('sha384','/tmp/composer-setup.php') !== '$HASH') { exit(1); }"
+            php -r "if (hash_file(\"sha384\",\"/tmp/composer-setup.php\") !== \"$HASH\") { exit(1); }"
             php /tmp/composer-setup.php --install-dir=/usr/local/bin --filename=composer
-          fi
+            php -v | head -1; composer --version
+            composer install --no-dev --no-interaction --prefer-dist --no-progress --no-scripts --ignore-platform-reqs
+          '
+
           if ! command -v npm >/dev/null 2>&1; then
             curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
             apt-get install -y -qq nodejs
           fi
-          php -v | head -1; composer --version; node -v; npm -v
-          composer install --no-dev --no-interaction --prefer-dist --no-progress --no-scripts --ignore-platform-reqs
+          node -v; npm -v
           npm ci && npm run build
 
       - name: Create staging dir on server
