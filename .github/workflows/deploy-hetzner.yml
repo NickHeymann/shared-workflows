@@ -54,6 +54,11 @@ on:
         required: false
         type: string
         default: 'self-hosted'
+      node-version:
+        description: 'Node-Hauptversion (Docker-Tag von node:<version>) fuer den Vite-Build im Quick-Deploy. Der Build laeuft im node-Container und ist damit unabhaengig davon, welches Node/npm das Runner-Image mitbringt.'
+        required: false
+        type: string
+        default: '22'
 
 env:
   REGISTRY: ghcr.io
@@ -111,17 +116,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Install PHP + Node inline rather than via shivammathur/setup-php +
-      # actions/setup-node: those marketplace actions cannot provision a runtime
-      # on the lean self-hosted runner ("Could not setup PHP 8.4"). The runner
-      # image is Debian-based, so apt + NodeSource work directly.
+      # Composer und Node laufen je in einem eigenen Container statt ueber
+      # shivammathur/setup-php + actions/setup-node: die Marketplace-Actions
+      # koennen auf dem schlanken self-hosted Runner keine Laufzeit bereitstellen
+      # ("Could not setup PHP 8.4"), und das Runner-Image selbst ist nicht stabil
+      # (siehe unten).
       # vendor/ is needed at Vite-build time: app.js imports Livewire+Alpine from
       # vendor/livewire/livewire/dist/livewire.esm.
       - name: Setup PHP + Node + build assets
+        env:
+          NODE_VERSION: ${{ inputs.node-version }}
         run: |
           set -e
-          export DEBIAN_FRONTEND=noninteractive
-          apt-get update -qq
 
           # composer install laeuft in einem echten php:8.4-cli-Container,
           # NICHT per apt auf dem Runner-Host. Grund: der Runner-Host ist
@@ -150,12 +156,17 @@ jobs:
             composer install --no-dev --no-interaction --prefer-dist --no-progress --no-scripts --ignore-platform-reqs
           '
 
-          if ! command -v npm >/dev/null 2>&1; then
-            curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-            apt-get install -y -qq nodejs
-          fi
-          node -v; npm -v
-          npm ci && npm run build
+          # Node/npm kommen aus einem node-Container, NICHT vom Runner-Image.
+          # Grund: myoung34/github-runner:latest wurde am 2026-11-09 auf Ubuntu
+          # 26.04 umgestellt und liefert nodejs ohne npm; der frueher hier
+          # stehende Fallback (`command -v npm` + NodeSource) installierte nichts,
+          # weil apt das vorhandene Ubuntu-nodejs behielt -> "npm: command not
+          # found". Gleiches Muster wie beim composer-Schritt oben.
+          docker run --rm -v "$PWD":/app -w /app "node:${NODE_VERSION}" sh -c '
+            set -e
+            node -v; npm -v
+            npm ci && npm run build
+          '
 
       - name: Create staging dir on server
         uses: appleboy/ssh-action@v1.2.5
