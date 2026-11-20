@@ -515,8 +515,15 @@ jobs:
               exit 1
             fi
             compose_up() {
-              local svc s keep="" app=""
-              for svc in $(docker compose config --services </dev/null); do
+              local svc s keep="" app="" all
+              # Zuweisung getrennt, damit ein Fehler von compose config (set -e) den Deploy
+              # abbricht statt mit leerer Dienstliste still nichts zu tun.
+              all=$(docker compose config --services </dev/null)
+              if [ -z "$all" ]; then
+                echo "::error::docker compose config --services lieferte keine Dienste"
+                exit 1
+              fi
+              for svc in $all; do
                 local is_stateful=0
                 for s in $STATEFUL_NORM; do
                   if [ "$s" = "$svc" ]; then is_stateful=1; fi
