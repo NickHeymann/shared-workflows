@@ -86,6 +86,30 @@ That's it. Push to `main` → build+test+deploy on Hetzner, zero Actions minutes
   cd /opt/apps/gha-runner-<repo> && docker compose up -d   # restart
   ```
 
+## Deploy startet Zustandsdienste nicht neu (`stateful-services`)
+
+Bisher lief im Deploy `docker compose up -d --force-recreate` ohne Dienstliste und
+erzeugte bei jedem Deploy auch Redis und Datenbanken neu. Folge: kurzzeitig
+„Connection refused“, Queue-Worker und Scheduler verloren Läufe (EQUON, 16.11. bis 19.11.).
+
+Neue optionale Eingabe `stateful-services` (Ausschlussliste, Dienstnamen aus der
+`compose.yml`, durch Leerzeichen, Komma oder Zeilenumbruch getrennt). Standard:
+`redis valkey keydb memcached postgres postgresql pgsql db database mysql mariadb mongo mongodb rabbitmq minio`.
+
+Ablauf je Deploy-Pfad (auch `extra-deploy-paths`):
+
+1. `docker compose up -d <Zustandsdienste>`: Compose erzeugt einen Dienst nur neu, wenn
+   sich Image oder Konfiguration geändert haben, fehlende Dienste werden gestartet.
+   Ein geändertes Redis- oder Postgres-Image wird also trotzdem übernommen.
+2. `docker compose up -d --force-recreate --no-deps <übrige Dienste>`: Anwendungsdienste
+   (app, queue, scheduler, ...) wie bisher zwangsweise neu.
+
+`stateful-services: ''` stellt das alte Verhalten wieder her. Heißt der Redis- oder
+Datenbankdienst eines Repos anders als in der Liste, den Namen in `stateful-services`
+ergänzen (die Eingabe ersetzt den Standard, also die Standardliste mitgeben).
+Verfügbar ab der Version, die diese Änderung trägt (siehe Tag-Liste im PR); ältere Tags
+behalten das alte Verhalten.
+
 ## Tooling (on the Mac, ~/.claude/scripts/ci/)
 
 | Script | Purpose |
