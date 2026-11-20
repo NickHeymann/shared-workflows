@@ -534,8 +534,10 @@ jobs:
               echo "Anwendungsdienste (--force-recreate):${app:- keine}"
               # 1) Zustandsdienste: Compose erzeugt nur bei geaendertem Image oder
               #    geaenderter Konfiguration neu, fehlende Dienste werden gestartet.
+              #    --wait (laufend, mit Healthcheck gesund) ersetzt die Bereitschaft, die
+              #    --no-deps unten ueberspringt (depends_on: condition: service_healthy).
               if [ -n "$keep" ]; then
-                docker compose up -d $keep </dev/null
+                timeout 300 docker compose up -d --wait $keep </dev/null
               fi
               # 2) Anwendungsdienste wie bisher zwangsweise neu, ohne Abhaengigkeiten.
               if [ -n "$app" ]; then
