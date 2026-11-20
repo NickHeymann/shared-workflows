@@ -322,9 +322,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -444,22 +441,39 @@ jobs:
           BUILD_SLOT_SCRIPT
           bash "$RUNNER_TEMP/build-slot.sh" acquire
 
+      # Reuse a long-lived docker-container builder instead of a per-run one.
+      # The builder's BuildKit container + cache live in a host Docker volume
+      # (buildx_buildkit_hetzner-persistent0_state) that persists BETWEEN jobs
+      # and across repos — so an unchanged base/deps stage + RUN --mount=type=
+      # cache caches are reused instantly, with NO GHCR cache round-trip.
+      #
+      # buildx builder *instances* are client-side (~/.docker/buildx), and the
+      # self-hosted runner's home is wiped per job, so the instance reference
+      # isn't there even though the builder's state volume is. We (re)create the
+      # instance each run with the SAME name: because the docker-container state
+      # volume already exists on the host, this reattaches to it (cache intact)
+      # rather than building a fresh empty builder. `|| true` makes it idempotent.
+      - name: Ensure persistent buildx builder
+        run: |
+          docker buildx create --name hetzner-persistent \
+            --driver docker-container --bootstrap 2>/dev/null \
+            || docker buildx inspect hetzner-persistent --bootstrap
+          docker buildx ls
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
+          # Build on the pre-existing persistent host builder (see note above).
+          builder: hetzner-persistent
           context: ${{ inputs.docker-context }}
           push: true
           tags: |
             ghcr.io/${{ inputs.image-name }}:latest
             ghcr.io/${{ inputs.image-name }}:${{ github.sha }}
-          # Cache via a per-image GHCR tag, NOT type=gha. On the self-hosted
-          # Hetzner runner type=gha round-trips every layer (mode=max) to
-          # GitHub's cache service over the public internet — slow, and wasteful
-          # since the runner builds on the same host it deploys to. A registry
-          # cache tag lives in GHCR (local network for the runner) and is pulled
-          # layer-by-layer, so an unchanged base/deps stage is reused instantly.
-          cache-from: type=registry,ref=ghcr.io/${{ inputs.image-name }}:buildcache
-          cache-to: type=registry,ref=ghcr.io/${{ inputs.image-name }}:buildcache,mode=max
+          # No cache-from/to: the persistent docker-container builder above keeps
+          # its full layer cache + RUN --mount=type=cache caches in its local
+          # state volume between jobs. That is strictly faster than the previous
+          # type=registry GHCR round-trip and needs no cache push/pull at all.
 
       - name: Build-Platz freigeben
         if: always()
