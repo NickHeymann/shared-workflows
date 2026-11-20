@@ -452,7 +452,7 @@ jobs:
       # isn't there even though the builder's state volume is. We (re)create the
       # instance each run with the SAME name: because the docker-container state
       # volume already exists on the host, this reattaches to it (cache intact)
-      # rather than building a fresh empty builder. `|| true` makes it idempotent.
+      # rather than building a fresh empty builder. The `||` fallback makes it idempotent.
       - name: Ensure persistent buildx builder
         run: |
           docker buildx create --name hetzner-persistent \
