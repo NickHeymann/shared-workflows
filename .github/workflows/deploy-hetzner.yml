@@ -54,6 +54,11 @@ on:
         required: false
         type: string
         default: 'self-hosted'
+      stateful-services:
+        description: 'Compose-Dienstnamen (Leerzeichen, Komma oder Zeilenumbruch getrennt), die beim Deploy NICHT zwangsweise neu erzeugt werden (Redis, Datenbanken und andere Dienste mit Volume). Sie werden mit einem normalen compose up -d aktualisiert: Compose erzeugt sie nur neu, wenn sich Image oder Konfiguration geaendert haben, sonst laufen sie ohne Unterbrechung weiter. Alle uebrigen Dienste werden wie bisher mit --force-recreate neu erzeugt. Leerer String stellt das alte Verhalten wieder her (alles zwangsweise neu).'
+        required: false
+        type: string
+        default: 'redis valkey keydb memcached postgres postgresql pgsql db database mysql mariadb mongo mongodb rabbitmq minio'
       node-version:
         description: 'Node-Hauptversion (Docker-Tag von node:<version>) fuer den Vite-Build im Quick-Deploy. Der Build laeuft im node-Container und ist damit unabhaengig davon, welches Node/npm das Runner-Image mitbringt.'
         required: false
@@ -485,13 +490,45 @@ jobs:
 
             echo "$GHCR_TOKEN" | docker login ghcr.io -u nickheymann --password-stdin
 
+            # Compose-Start: Zustandsdienste (Redis, Datenbanken, ...) nie zwangsweise
+            # neu erzeugen, sonst verlieren Queue-Worker und Scheduler waehrend des
+            # Neustarts ihre Verbindung. Der Nutzwert von --force-recreate (frische
+            # env_file/Mount-Inhalte, neues :latest) betrifft nur die Anwendungsdienste.
+            STATEFUL_SERVICES="${{ inputs.stateful-services }}"
+            STATEFUL_NORM=$(printf '%s' "$STATEFUL_SERVICES" | tr ',\n\r\t' '    ')
+            if ! [[ "$STATEFUL_NORM" =~ ^[A-Za-z0-9_.\ -]*$ ]]; then
+              echo "::error::stateful-services enthaelt ungueltige Zeichen"
+              exit 1
+            fi
+            compose_up() {
+              local svc s keep="" app=""
+              for svc in $(docker compose config --services </dev/null); do
+                local is_stateful=0
+                for s in $STATEFUL_NORM; do
+                  if [ "$s" = "$svc" ]; then is_stateful=1; fi
+                done
+                if [ "$is_stateful" = 1 ]; then keep="$keep $svc"; else app="$app $svc"; fi
+              done
+              echo "Zustandsdienste (kein Zwangs-Neustart):${keep:- keine}"
+              echo "Anwendungsdienste (--force-recreate):${app:- keine}"
+              # 1) Zustandsdienste: Compose erzeugt nur bei geaendertem Image oder
+              #    geaenderter Konfiguration neu, fehlende Dienste werden gestartet.
+              if [ -n "$keep" ]; then
+                docker compose up -d $keep </dev/null
+              fi
+              # 2) Anwendungsdienste wie bisher zwangsweise neu, ohne Abhaengigkeiten.
+              if [ -n "$app" ]; then
+                docker compose up -d --force-recreate --no-deps $app </dev/null
+              fi
+            }
+
             cd "${{ inputs.deploy-path }}"
             docker compose pull
 
             # Pre-deploy commands (e.g. migrations before up)
             ${{ inputs.pre-deploy-commands }}
 
-            docker compose up -d --force-recreate
+            compose_up
 
             # Post-deploy commands (cache, health check, etc.)
             ${{ inputs.post-deploy-commands }}
@@ -505,7 +542,7 @@ jobs:
                   echo "Deploying to extra path: $path"
                   cd "$path"
                   docker compose pull
-                  docker compose up -d --force-recreate
+                  compose_up
                 fi
               done
             fi
