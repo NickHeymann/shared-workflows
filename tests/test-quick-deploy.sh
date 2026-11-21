@@ -150,6 +150,14 @@ esac
 [ "$1" = "cp" ] && echo "marker-bei-cp=$([ -e "$MARKER" ] && echo da || echo weg)" >> "$FAKE_LOG"
 [ "$1" = "cp" ] && [ -n "${FAKE_CONCURRENT:-}" ] && echo "$FAKE_CONCURRENT" > "$MARKER"   # anderer Deploy schreibt mitten im Lauf seinen Vermerk
 [ "$1" = "cp" ] && [ "${FAKE_FAIL:-}" = "cp" ] && exit 1
+if [ "$1 $2" = "compose pull" ] && [ -n "${FAKE_PULL_FAILS:-}" ]; then
+  n=$(cat "$FAKE_LOG.pulln" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$FAKE_LOG.pulln"
+  if [ "$n" -le "$FAKE_PULL_FAILS" ]; then
+    echo "${FAKE_PULL_MSG:-NotFound: content digest sha256:abc: not found}" >&2
+    [ -n "${FAKE_PULL_LONG:-}" ] && head -c 600000 /dev/zero | tr '\0' 'x' | fold -w 80 >&2
+    exit 1
+  fi
+fi
 if [ "$1" = "compose" ] && [ "$2" = "config" ]; then printf 'app\nredis\n'; exit 0; fi
 if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "${FAKE_FAIL:-}" = "up" ]; then exit 1; fi
 if [ "$1" = "inspect" ]; then
@@ -393,6 +401,30 @@ case "$STG" in *needs.detect-changes.outputs.stage*github.run_attempt*) ok "Stag
 [ "$(grep -c '/tmp/quick-deploy[^-]' "$WF")" = "0" ] && ok "kein fester Pfad /tmp/quick-deploy mehr" || fail "fester Pfad /tmp/quick-deploy vorhanden"
 CLEAN_IF=$(ruby -ryaml -e 'wf=YAML.load_file(ARGV[0]); s=wf["jobs"]["quick-deploy"]["steps"].find{|x| x["name"].to_s.include?("Remove staging")}; puts s ? s["if"] : "fehlt"' "$WF")
 expect "Aufräumschritt für das Staging läuft immer (if: always())" "always()" "$CLEAN_IF"
+
+# compose pull: begrenzte Wiederholung nur bei NotFound: content digest
+echo "== compose pull Wiederholung"
+rm -f "$WORK/fake.log.pulln"
+FAKE_PULL_FAILS=1 PULL_RETRY_WAIT=0 run_full "" "$C4" app "$C1"; RC=$?
+expect "Pull: ein NotFound-Fehler, zweiter Versuch gelingt -> Exit 0" "0" "$RC"
+expect "Pull: genau zwei Pull-Versuche" "2" "$(grep -c '^docker compose pull' "$WORK/fake.log")"
+grep -q 'Versuch 1 von 3' "$WORK/full.out" && ok "Pull: laute Warnung mit Versuchszähler" || fail "Pull: keine Warnung"
+expect "Pull: Vermerk nach Erfolg geschrieben" "$C4" "$(marker "$SERVER/app")"
+rm -f "$WORK/fake.log.pulln"
+FAKE_PULL_FAILS=9 PULL_RETRY_WAIT=0 run_full "" "$C4" app "$C1"; RC=$?
+[ "$RC" -ne 0 ] && ok "Pull: dauerhaft NotFound -> Lauf rot nach 3 Versuchen" || fail "Pull: dauerhafter Fehler wird verschluckt"
+expect "Pull: genau drei Versuche, dann Schluss" "3" "$(grep -c '^docker compose pull' "$WORK/fake.log")"
+grep -q 'scheiterte 3 Mal' "$WORK/full.out" && ok "Pull: laute Fehlermeldung" || fail "Pull: keine Fehlermeldung nach 3 Versuchen"
+expect "Pull: ... kein Vermerk (nichts ausgerollt)" "-" "$(marker "$SERVER/app")"
+rm -f "$WORK/fake.log.pulln"
+FAKE_PULL_FAILS=9 FAKE_PULL_MSG="unauthorized: authentication required" PULL_RETRY_WAIT=0 run_full "" "$C4" app "$C1"; RC=$?
+[ "$RC" -ne 0 ] && ok "Pull: anderer Fehler -> Lauf rot" || fail "Pull: anderer Fehler wird verschluckt"
+expect "Pull: anderer Fehler wird NICHT wiederholt (ein Versuch)" "1" "$(grep -c '^docker compose pull' "$WORK/fake.log")"
+rm -f "$WORK/fake.log.pulln"
+FAKE_PULL_FAILS=1 FAKE_PULL_LONG=1 PULL_RETRY_WAIT=0 run_full "" "$C4" app "$C1"; RC=$?
+expect "Pull: Fehler steht VOR 600 kB Ausgabe (SIGPIPE-Fall) -> trotzdem Wiederholung, Exit 0" "0" "$RC"
+expect "Pull: ... zwei Versuche" "2" "$(grep -c '^docker compose pull' "$WORK/fake.log")"
+rm -f "$WORK/fake.log.pulln"
 
 echo "== Build-Label"
 BUILD_LABEL=$(ruby -ryaml -e 'wf=YAML.load_file(ARGV[0]); s=wf["jobs"]["full-deploy"]["steps"].find{|x| x["name"]=="Build and push Docker image"}; puts s["with"]["labels"]' "$WF")
