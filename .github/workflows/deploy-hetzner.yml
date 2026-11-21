@@ -75,10 +75,17 @@ jobs:
     outputs:
       quick: ${{ steps.check.outputs.quick }}
       base: ${{ steps.check.outputs.base }}
+      stage: ${{ steps.stage.outputs.dir }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 2
+
+      # Eindeutiger Name des Staging-Verzeichnisses je Aufruf dieses Workflows (auch bei
+      # mehreren parallelen Aufrufen im selben Workflow-Lauf, z. B. Matrix: gleiche run_id).
+      - name: Staging name
+        id: stage
+        run: echo "dir=quick-deploy-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')" >> "$GITHUB_OUTPUT"
 
       # Basis des Quick-Deploys: der zuletzt VOLLSTÄNDIG ausgerollte Commit, vom Ziel
       # selbst gemeldet (Datei <deploy-path>/.quick-deploy-basis, geschrieben erst nach
@@ -130,6 +137,9 @@ jobs:
           if ! printf '%s' "$BASE" | grep -qE '^[0-9a-f]{40}$'; then
             full_deploy "kein gültiger Basis-Vermerk am Server (erster Deploy mit Basis-Prüfung oder Lesefehler)"
           fi
+          # Gelesene Basis immer melden (auch wenn danach der Full-Deploy gewählt wird): der
+          # Full-Deploy prüft unter der Server-Sperre, dass der Vermerk noch dieser ist.
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
           if ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
             git fetch --no-tags --depth=1 origin "$BASE" 2>/dev/null || true
           fi
@@ -142,6 +152,12 @@ jobs:
           # diesem Schritt). Ist der Stand identisch (Wiederholung desselben Commits), läuft es normal.
           if [ "$BASE" != "$(git rev-parse HEAD)" ]; then
             git fetch --no-tags --unshallow origin 2>/dev/null || git fetch --no-tags origin 2>/dev/null || true
+            # Bleibt die Historie flach, ist "kein Vorfahr" nicht belastbar (Gegenbeispiel: alter
+            # Commit und Basis durch die flache Grenze getrennt). Dann nicht deployen.
+            if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+              echo "::error::Abbruch: Historie konnte nicht vollständig geladen werden, die Prüfung gegen den Basis-Vermerk $BASE ist nicht möglich. Nichts ausgerollt. Lauf wiederholen."
+              exit 1
+            fi
             if git merge-base --is-ancestor HEAD "$BASE" 2>/dev/null; then ANC=0; else ANC=$?; fi
             if [ "$ANC" -eq 0 ]; then
               echo "::error::Abbruch: Commit $(git rev-parse HEAD) ist älter als der am Ziel ausgerollte Stand $BASE (Vermerk .quick-deploy-basis). Ein alter Lauf (Rerun) würde einen neueren Stand überschreiben. Nichts ausgerollt. Für einen bewussten Rückschritt den Vermerk am Ziel löschen oder einen neuen Revert-Commit pushen."
@@ -154,7 +170,6 @@ jobs:
             full_deploy "Diff gegen Basis $BASE fehlgeschlagen"
           fi
           echo "Basis (zuletzt ausgerollt): $BASE"
-          echo "base=$BASE" >> "$GITHUB_OUTPUT"
           echo "Changed files since basis:"
           echo "$CHANGED"
 
@@ -193,9 +208,9 @@ jobs:
     if: needs.detect-changes.outputs.quick == 'true'
     runs-on: ${{ inputs.runner }}
     env:
-      # Staging-Verzeichnis am Server je Lauf (Lauf-ID ist über alle Repos eindeutig): zwei
-      # gleichzeitige Quick-Deploys verschiedener Repos vertauschen keine Dateien mehr.
-      STAGING_DIR: /tmp/quick-deploy-${{ github.run_id }}-${{ github.run_attempt }}
+      # Staging-Verzeichnis am Server je Aufruf (Lauf-ID, Versuch und Zufallsanteil aus
+      # detect-changes): gleichzeitige Quick-Deploys vertauschen keine Dateien.
+      STAGING_DIR: /tmp/${{ needs.detect-changes.outputs.stage }}
     steps:
       - uses: actions/checkout@v4
 
@@ -682,11 +697,12 @@ jobs:
         uses: appleboy/ssh-action@v1.2.5
         env:
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          EXPECTED_BASE: ${{ needs.detect-changes.outputs.base }}
         with:
           host: 46.224.6.69
           username: root
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          envs: GHCR_TOKEN
+          envs: GHCR_TOKEN,EXPECTED_BASE
           timeout: 30s
           command_timeout: 15m
           script: |
@@ -785,6 +801,17 @@ jobs:
                   exit 1
                 fi
               done
+              # Entscheidungsbasis unter der Sperre erneut prüfen: hat inzwischen ein anderer Lauf
+              # (z. B. ein am Server weiterlaufender abgebrochener Deploy) einen anderen Stand
+              # ausgerollt als der, auf dem detect-changes entschieden hat, nicht überschreiben.
+              CUR_BASIS=""
+              if [ -f "${{ inputs.deploy-path }}/.quick-deploy-basis" ]; then
+                CUR_BASIS=$(head -n 1 "${{ inputs.deploy-path }}/.quick-deploy-basis" | tr -d '[:space:]')
+              fi
+              if printf '%s' "$CUR_BASIS" | grep -qE '^[0-9a-f]{40}$' && [ "$CUR_BASIS" != "${EXPECTED_BASE:-}" ]; then
+                echo "::error::Abbruch: Der Basis-Vermerk am Ziel ($CUR_BASIS) hat sich seit der Prüfung geändert (erwartet: ${EXPECTED_BASE:-keiner}). Ein anderer Deploy war dazwischen. Nichts ausgerollt. Lauf wiederholen."
+                exit 1
+              fi
               rm -f "${{ inputs.deploy-path }}/.quick-deploy-basis" "${{ inputs.deploy-path }}/.quick-deploy-basis".tmp.*
             fi
             # Extra-Pfade bekommen ebenfalls neuen Code: ein eigener Vermerk dort (der Pfad

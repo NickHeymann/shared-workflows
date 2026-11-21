@@ -57,6 +57,7 @@ runner_clone() {
 
 run_check() { # basis_raw app_container  -> gibt quick=... aus
   runner_clone
+  [ -n "${BREAK_REMOTE:-}" ] && git -C "$WORK/runner" remote set-url origin "file://$WORK/gibt-es-nicht.git"
   local out="$WORK/gh-output"
   : > "$out"
   local script="$WORK/check.sh"
@@ -102,6 +103,12 @@ expect "alter Rerun: Basis ist neuer als HEAD (Vorfahr) -> Abbruch" "exit1" "$(r
 grep -q 'älter als der am Ziel' "$WORK/check.log" && ok "alter Rerun: klare Meldung" || fail "alter Rerun: keine klare Meldung"
 expect "Rerun desselben Commits (Basis=HEAD) -> kein Abbruch" "quick=true" "$(run_check "QUICK_DEPLOY_BASIS=$C4" app)"
 expect "Vorfahren-Prüfung greift vor der Einstufung (gilt für Quick und Full) -> Abbruch" "exit1" "$(run_check "QUICK_DEPLOY_BASIS=$C5" app)"
+# Historie nicht nachladbar (flacher Klon, Origin nicht erreichbar): nicht deployen statt als "kein Vorfahr" werten
+BREAK_REMOTE=1 run_check "QUICK_DEPLOY_BASIS=$C3" app > "$WORK/brk.out"; RCB=$(BREAK_REMOTE=1 run_check "QUICK_DEPLOY_BASIS=$C3" app)
+expect "flache Historie, Nachladen scheitert -> Abbruch statt quick" "exit1" "$RCB"
+grep -q 'Historie konnte nicht vollständig geladen' "$WORK/check.log" && ok "flache Historie: klare Meldung" || fail "flache Historie: keine klare Meldung"
+# Basis wird auch bei Full gemeldet (Prüfung unter der Server-Sperre)
+run_check "QUICK_DEPLOY_BASIS=$C0" app > /dev/null; grep -q "^base=$C0" "$WORK/gh-output" && ok "Basis-Ausgabe auch bei Full-Entscheidung" || fail "base fehlt bei Full-Entscheidung"
 # nginx.conf: ehrliche Meldung
 run_check "QUICK_DEPLOY_BASIS=$C1" app > /dev/null
 grep -q 'nginx.conf hat sich geändert, wird aber NICHT ausgerollt' "$WORK/check.log" && ok "nginx.conf-Änderung: Lauf meldet, dass sie nicht ausgerollt wird" || fail "nginx.conf: keine ehrliche Meldung"
@@ -234,7 +241,7 @@ run_full() { # fail label app-container vorhandener-vermerk  (FULL_EXTRA: Extra-
   : > "$WORK/fake.log"
   INPUT_DEPLOY_PATH="$SERVER/app" INPUT_APP_CONTAINER="$3" GITHUB_SHA_VALUE="$SHA_VALUE" INPUT_STATEFUL_SERVICES="redis" INPUT_PRE_DEPLOY_COMMANDS="" INPUT_POST_DEPLOY_COMMANDS="" INPUT_EXTRA_DEPLOY_PATHS="${FULL_EXTRA:+$SERVER/staging}" \
     "$EXTRACT" "$WF" full-deploy "Deploy to Hetzner" --key script | nolock > "$WORK/full.sh"
-  PATH="$BIN:$PATH" FAKE_LOG="$WORK/fake.log" MARKER="$SERVER/app/.quick-deploy-basis" FAKE_FAIL="$1" FAKE_LABEL="$2" GHCR_TOKEN=x \
+  PATH="$BIN:$PATH" FAKE_LOG="$WORK/fake.log" MARKER="$SERVER/app/.quick-deploy-basis" FAKE_FAIL="$1" FAKE_LABEL="$2" GHCR_TOKEN=x EXPECTED_BASE="${EXP_OVERRIDE-$4}" \
     bash "$WORK/full.sh" > "$WORK/full.out" 2>&1
 }
 
@@ -257,6 +264,13 @@ FULL_EXTRA=1 run_full up "$C4" app "$C1"; RC=$?
 expect "Full: Vermerk eines Extra-Pfads wird vor der ersten Änderung ebenfalls ungültig (auch bei Abbruch)" "-" "$(marker "$SERVER/staging")"
 FULL_EXTRA=1 run_full "" "$C4" app "$C1"; RC=$?
 expect "Full: Extra-Pfad bekommt keinen eigenen Vermerk" "-" "$(marker "$SERVER/staging")"
+EXP_OVERRIDE="$C0" run_full "" "$C4" app "$C1"; RC=$?
+[ "$RC" -ne 0 ] && grep -q 'Basis-Vermerk am Ziel' "$WORK/full.out" && ok "Full: Vermerk am Ziel weicht von der geprüften Basis ab -> Abbruch" || fail "Full: Basisabweichung wird nicht erkannt (Exit $RC)"
+expect "Full: ... Vermerk unverändert, nichts ausgerollt" "$C1" "$(marker "$SERVER/app")"
+expect "Full: ... kein compose pull" "0" "$(grep -c 'compose pull' "$WORK/fake.log")"
+EXP_OVERRIDE="" run_full "" "$C4" app "$C1"; RC=$?
+[ "$RC" -ne 0 ] && ok "Full: Vermerk erschien nach der Prüfung (erwartet: keiner) -> Abbruch" || fail "Full: neu erschienener Vermerk wird ignoriert"
+echo "kaputt" > /dev/null
 run_full "" "$C4" "" "$C1"; RC=$?
 expect "Full ohne app-container: vorhandener Vermerk bleibt unberührt" "$C1" "$(marker "$SERVER/app")"
 run_full "" "$C4" "" ""; RC=$?
@@ -273,7 +287,7 @@ conc_setup() { # schreibt $WORK/c-apply.sh und $WORK/c-full.sh gegen $SERVER/app
   INPUT_DEPLOY_PATH="$SERVER/app" INPUT_APP_CONTAINER=app GITHUB_SHA_VALUE="$SHA_VALUE" INPUT_STATEFUL_SERVICES="redis" INPUT_PRE_DEPLOY_COMMANDS="" INPUT_POST_DEPLOY_COMMANDS="" INPUT_EXTRA_DEPLOY_PATHS="" \
     "$EXTRACT" "$WF" full-deploy "Deploy to Hetzner" --key script | nolock > "$WORK/c-full.sh"
 }
-conc_env() { PATH="$BIN:$PATH" FAKE_LOG="$WORK/fake.log" MARKER="$SERVER/app/.quick-deploy-basis" FAKE_EVENTS="$WORK/events" FAKE_STATE="$WORK/state" FAKE_SLEEP=1 FAKE_LABEL="$OTHER" env "$@"; }
+conc_env() { PATH="$BIN:$PATH" FAKE_LOG="$WORK/fake.log" MARKER="$SERVER/app/.quick-deploy-basis" FAKE_EVENTS="$WORK/events" FAKE_STATE="$WORK/state" FAKE_SLEEP=1 FAKE_LABEL="$OTHER" EXPECTED_BASE="$C1" env "$@"; }
 conc_setup
 # Quick (Basis C1) startet zuerst, der Full-Deploy mit anderer Revision kommt waehrend dessen dazu
 ( conc_env EXPECTED_BASE="$C1" OPCACHE_RESET_URL="https://x.invalid/reset" DEPLOY_TOKEN=t HAS_IMAGES=false bash -e "$WORK/c-apply.sh" > "$WORK/c-apply.out" 2>&1; echo $? > "$WORK/c-apply.rc" ) &
@@ -285,10 +299,11 @@ wait "$PID_Q" "$PID_F"
 # Ereignisse duerfen sich nie ueberlappen: auf "X-start" folgt sofort "X-end"
 OVERLAP=$(awk '/-start/{d++; if(d>1) bad=1} /-end/{d--} END{print bad?"ueberlappt":"getrennt"}' "$WORK/events")
 expect "zwei gleichzeitige Läufe (Quick und Full) überlappen nie" "getrennt" "$OVERLAP"
-expect "Full-Deploy lief durch (Exit 0)" "0" "$(cat "$WORK/c-full.rc")"
+[ "$(cat "$WORK/c-full.rc")" -ne 0 ] && grep -q 'Basis-Vermerk am Ziel' "$WORK/c-full.out" && ok "Full nach dem Quick: Basis hat sich geändert -> bricht laut ab (nichts ausgerollt)" || fail "Full prüft die Basis unter der Sperre nicht (Exit $(cat "$WORK/c-full.rc"))"
+expect "... Full hat nichts ausgerollt (kein compose pull)" "0" "$(grep -c 'compose pull' "$WORK/fake.log")"
 FINAL="$(marker "$SERVER/app")"
-if [ "$FINAL" = "-" ] || [ "$FINAL" = "$OTHER" ]; then ok "Vermerk passt zum ausgerollten Stand (leer oder Revision des Full-Deploys: $([ "$FINAL" = "-" ] && echo leer || echo Revision))"; else fail "Vermerk $FINAL passt nicht zum Stand (PHP aus $(cat "$WORK/state" 2>/dev/null))"; fi
-expect "der Stand am Ziel ist der des Full-Deploys" "$OTHER" "$(cat "$WORK/state" 2>/dev/null)"
+if [ "$FINAL" = "$SHA_VALUE" ] || [ "$FINAL" = "-" ] || [ "$FINAL" = "$OTHER" ]; then ok "Vermerk passt zum ausgerollten Stand (Quick-Revision, leer oder Revision des Full-Deploys: $FINAL)"; else fail "Vermerk $FINAL passt nicht zum Stand (PHP aus $(cat "$WORK/state" 2>/dev/null))"; fi
+[ "$(cat "$WORK/state" 2>/dev/null)" != "$OTHER" ] && ok "der Stand am Ziel stammt vom Quick-Deploy, nicht vom abgebrochenen Full" || fail "Full hat trotz geänderter Basis ausgerollt"
 ls "$SERVER/app" | grep -q 'tmp' && fail "temporäre Vermerk-Dateien übrig" || ok "keine temporären Vermerk-Dateien übrig"
 
 # Frist: ein zweiter Lauf scheitert laut, wenn die Sperre gehalten wird
@@ -374,7 +389,7 @@ grep -q 'mktemp -d' "$WORK/c-apply.sh" && ok "Rückmeldung der Sperre liegt in e
 
 # Staging-Verzeichnis je Lauf und Repo getrennt, Aufräumen auch bei Fehler
 STG=$(ruby -ryaml -e 'wf=YAML.load_file(ARGV[0]); puts wf["jobs"]["quick-deploy"].dig("env","STAGING_DIR").to_s' "$WF")
-case "$STG" in *github.run_id*github.run_attempt*) ok "Staging-Verzeichnis enthält Lauf-ID und Versuch: $STG" ;; *) fail "Staging-Verzeichnis nicht je Lauf getrennt: '$STG'" ;; esac
+case "$STG" in *needs.detect-changes.outputs.stage*) ok "Staging-Verzeichnis kommt aus dem Namensschritt je Aufruf: $STG" ;; *) fail "Staging-Verzeichnis nicht je Lauf getrennt: '$STG'" ;; esac
 [ "$(grep -c '/tmp/quick-deploy[^-]' "$WF")" = "0" ] && ok "kein fester Pfad /tmp/quick-deploy mehr" || fail "fester Pfad /tmp/quick-deploy vorhanden"
 CLEAN_IF=$(ruby -ryaml -e 'wf=YAML.load_file(ARGV[0]); s=wf["jobs"]["quick-deploy"]["steps"].find{|x| x["name"].to_s.include?("Remove staging")}; puts s ? s["if"] : "fehlt"' "$WF")
 expect "Aufräumschritt für das Staging läuft immer (if: always())" "always()" "$CLEAN_IF"

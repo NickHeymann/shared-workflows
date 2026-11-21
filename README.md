@@ -146,13 +146,14 @@ Jetzt gilt ein Basis-Vermerk am Ziel (`<deploy-path>/.quick-deploy-basis`, nur b
   Full 300 s je Pfad) und scheitert danach laut, er läuft nie parallel. Ein nach einem
   GitHub-Abbruch weiterlaufendes Deploy-Skript hält die Sperre bis zu seinem Ende.
   Temporäre Vermerk-Dateien sind laufbezogen (`.tmp.<PID>`).
-- Staging am Server je Lauf: `/tmp/quick-deploy-<run_id>-<run_attempt>` statt eines festen Pfads,
-  damit gleichzeitige Quick-Deploys verschiedener Repos nichts vertauschen. Ein Schritt
+- Staging am Server je Lauf: `/tmp/quick-deploy-<run_id>-<run_attempt>-<Zufall>` (Name aus `detect-changes`, je Aufruf eindeutig, auch bei
+  Matrix-Aufrufen) statt eines festen Pfads, damit gleichzeitige Quick-Deploys nichts vertauschen. Ein Schritt
   `Remove staging dir on server` (`if: always()`) räumt es auch bei Fehler oder Abbruch auf.
 - Schutz gegen alte Wiederholungen: Ist der zu deployende Commit ein Vorfahr des Vermerks
   (`git merge-base --is-ancestor`), bricht `detect-changes` mit klarer Meldung ab (gilt damit für
   Quick und Full, nur wenn ein Vermerk existiert). Gleicher Commit (Rerun desselben Stands) läuft
-  normal. Für einen bewussten Rückschritt: Revert-Commit pushen oder den Vermerk am Ziel löschen.
+  normal. Lässt sich die Historie nicht vollständig laden, bricht der Lauf ab. Der Full-Deploy prüft unter der
+  Server-Sperre erneut, dass der Vermerk noch der geprüfte ist (sonst Abbruch, Lauf wiederholen). Für einen bewussten Rückschritt: Revert-Commit pushen oder den Vermerk am Ziel löschen.
 - `nginx.conf` wird von keinem der beiden Deploys ausgerollt (am Server von Hand gepflegt). Ändert
   sich die Datei, meldet der Lauf das als Warnung und in der Zusammenfassung, statt sie still als
   ausgerollt zu führen.
