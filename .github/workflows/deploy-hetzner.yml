@@ -242,32 +242,6 @@ jobs:
           # `container: image: php:8.4-cli` -- hier dieselbe Idee, nur als
           # einzelner `docker run`-Schritt statt Job-Container, weil
           # spaetere Schritte (SSH-Deploy) auf dem Host laufen muessen.
-          # Basis-Image nur holen, wenn es lokal fehlt (vorhandene Images brauchen keine Registry), und zwar
-          # unmittelbar vor seinem `docker run`, mit begrenzter Wiederholung beim NotFound-Fehler des
-          # containerd-Speichers (gleichzeitiger docker image prune, moby/moby#53321). Der Runner
-          # läuft in einem Container ohne Zugriff auf die Sperre des Hosts, deshalb gibt es hier nur
-          # die Wiederholung als Sicherung, nicht die hostweite Sperre.
-          ensure_image() {
-            local img="$1" attempt=1 max=3 out rc
-            if docker image inspect "$img" >/dev/null 2>&1; then return 0; fi
-            while :; do
-              if out=$(docker pull "$img" 2>&1); then return 0; else rc=$?; fi
-              printf '%s\n' "$out"
-              case "$out" in
-                *"NotFound: content digest"*|*"lease does not exist"*) ;;
-                *) return "$rc" ;;
-              esac
-              if [ "$attempt" -ge "$max" ]; then
-                echo "::error::docker pull $img scheiterte $max Mal an fehlendem Inhalt im Image-Speicher (NotFound: content digest)."
-                return "$rc"
-              fi
-              echo "::warning::docker pull $img: Inhalt im Image-Speicher fehlt (vermutlich gleichzeitiger docker image prune). Versuch $attempt von $max, neuer Versuch in ${PULL_RETRY_WAIT:-15} Sekunden."
-              attempt=$((attempt + 1))
-              sleep "${PULL_RETRY_WAIT:-15}"
-            done
-          }
-
-          ensure_image php:8.4-cli
           docker run --rm -v "$PWD":/app -w /app php:8.4-cli sh -c '
             set -e
             export DEBIAN_FRONTEND=noninteractive
@@ -287,7 +261,6 @@ jobs:
           # stehende Fallback (`command -v npm` + NodeSource) installierte nichts,
           # weil apt das vorhandene Ubuntu-nodejs behielt -> "npm: command not
           # found". Gleiches Muster wie beim composer-Schritt oben.
-          ensure_image "node:${NODE_VERSION}"
           docker run --rm -v "$PWD":/app -w /app "node:${NODE_VERSION}" sh -c '
             set -e
             node -v; npm -v
@@ -831,46 +804,6 @@ jobs:
               rm -f "$ok"; rmdir "$ok_dir"
             }
 
-            # Hostweite Docker-Image-Sperre (flock auf /var/lock/docker-image.lock): Pull und
-            # compose up halten sie GETEILT, jedes Aufräumen (docker image/builder prune) hält
-            # sie EXKLUSIV. Ein Prune läuft so nie mitten in einem Pull und löscht dessen Lease
-            # (moby/moby#53321, NotFound: content digest). Mehrere Deploys teilen sich die Sperre
-            # und blockieren einander nicht. Wie die Pfad-Sperre hält sie ein Hilfsprozess, der
-            # bei docker_unlock oder spätestens mit dem Ende dieses Skripts endet.
-            DOCKER_LOCK_FILE="${DOCKER_LOCK_FILE:-/var/lock/docker-image.lock}"
-            DOCKER_LOCK_DIR=""
-            docker_lock() { # s|x frist-in-sekunden
-              local mode="$1" wait_s="$2" ticks=0 max_ticks
-              DOCKER_LOCK_DIR=$(mktemp -d) || { DOCKER_LOCK_DIR=""; echo "::error::mktemp fehlgeschlagen, Docker-Sperre nicht möglich."; return 1; }
-              flock "-$mode" -w "$wait_s" "$DOCKER_LOCK_FILE" sh -c 'echo gesperrt > "$1/gesperrt" || exit 1; while kill -0 "$2" 2>/dev/null && [ ! -e "$1/frei" ]; do sleep 1; done' sh "$DOCKER_LOCK_DIR" "$$" >/dev/null 2>&1 &
-              DOCKER_LOCK_PID=$!
-              max_ticks=$(( (wait_s + 30) * 5 ))
-              while [ ! -s "$DOCKER_LOCK_DIR/gesperrt" ]; do
-                if ! kill -0 "$DOCKER_LOCK_PID" 2>/dev/null && [ ! -s "$DOCKER_LOCK_DIR/gesperrt" ]; then
-                  rmdir "$DOCKER_LOCK_DIR" 2>/dev/null; DOCKER_LOCK_DIR=""
-                  echo "::warning::Docker-Sperre $DOCKER_LOCK_FILE ($mode) nach $wait_s Sekunden nicht erhalten."
-                  return 1
-                fi
-                ticks=$((ticks + 1))
-                if [ "$ticks" -ge "$max_ticks" ]; then
-                  kill "$DOCKER_LOCK_PID" 2>/dev/null
-                  rm -rf "$DOCKER_LOCK_DIR"; DOCKER_LOCK_DIR=""
-                  echo "::warning::Docker-Sperre $DOCKER_LOCK_FILE ($mode): keine Rückmeldung des Sperr-Hilfsprozesses innerhalb der Frist."
-                  return 1
-                fi
-                sleep 0.2
-              done
-              return 0
-            }
-            docker_unlock() {
-              if [ -n "$DOCKER_LOCK_DIR" ]; then
-                : > "$DOCKER_LOCK_DIR/frei"
-                wait "$DOCKER_LOCK_PID" 2>/dev/null || true
-                rm -rf "$DOCKER_LOCK_DIR"
-                DOCKER_LOCK_DIR=""
-              fi
-            }
-
             cd "${{ inputs.deploy-path }}"
 
             # Basis-Vermerk ungültig machen, BEVOR das Ziel verändert wird (nur bei Repos
@@ -907,14 +840,6 @@ jobs:
                 rm -f "$extra/.quick-deploy-basis" "$extra"/.quick-deploy-basis.tmp.*
               fi
             done
-
-            # Geteilte Docker-Sperre für Pull, compose up und alle Befehle dazwischen (bis vor
-            # das Aufräumen am Ende). Ist ein Prune gerade aktiv, wartet der Deploy bis zur Frist;
-            # danach bricht er laut ab, BEVOR etwas ausgerollt wird (ein Prune dauert Minuten).
-            if ! docker_lock s 300; then
-              echo "::error::Docker-Sperre (geteilt) nicht erhalten: ein docker prune läuft zu lange oder hängt. Nichts ausgerollt. Lauf wiederholen."
-              exit 1
-            fi
 
             compose_pull
 
@@ -960,14 +885,5 @@ jobs:
               fi
             fi
 
-            # Cleanup old images (skip recently used to avoid race with concurrent deploys).
-            # Zuerst die geteilte Sperre dieses Deploys freigeben, dann EXKLUSIV aufräumen: läuft
-            # gerade ein anderer Deploy (hält die Sperre geteilt), wird das Aufräumen nach kurzer
-            # Frist übersprungen statt in dessen Pull zu laufen. Das nächste Aufräumen holt es nach.
-            docker_unlock
-            if docker_lock x 60; then
-              docker image prune -f --filter "until=1h" || echo "::warning::docker image prune fehlgeschlagen (Deploy selbst ist ausgerollt)"
-              docker_unlock
-            else
-              echo "::warning::Aufräumen übersprungen: Docker-Sperre nicht frei (ein anderer Deploy pullt gerade). Der Deploy selbst ist ausgerollt."
-            fi
+            # Cleanup old images (skip recently used to avoid race with concurrent deploys)
+            docker image prune -f --filter "until=1h"
