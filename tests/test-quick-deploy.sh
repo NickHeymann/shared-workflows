@@ -62,7 +62,7 @@ run_check() { # basis_raw app_container  -> gibt quick=... aus
   : > "$out"
   local script="$WORK/check.sh"
   INPUT_APP_CONTAINER="$2" "$EXTRACT" "$WF" detect-changes check > "$script" || { echo "EXTRAKTIONSFEHLER"; return; }
-  (cd "$WORK/runner" && GITHUB_OUTPUT="$out" APP_CONTAINER="$2" BASIS_RAW="$1" bash -e "$script" > "$WORK/check.log" 2>&1)
+  (cd "$WORK/runner" && GITHUB_OUTPUT="$out" APP_CONTAINER="$2" PUBLIC_VOLUME="${PUBLIC_VOLUME-/srv/public-volume}" BASIS_RAW="$1" bash -e "$script" > "$WORK/check.log" 2>&1)
   local rc=$?
   if [ "$rc" -ne 0 ]; then echo "exit$rc"; return; fi
   grep -E '^quick=' "$out" | tail -n 1
@@ -77,8 +77,10 @@ expect "normaler Merge: Basis=Vorgänger, PHP-Datei -> full" "quick=false" \
 # liegt vor der Basis. Der Fall "überholter Lauf": Basis C0, PHP-Commit C1 nie ausgerollt, HEAD C4.
 expect "überholter Lauf: PHP-Commit liegt zwischen Basis und HEAD -> full" "quick=false" \
   "$(run_check "QUICK_DEPLOY_BASIS=$C0" app)"
-expect "Basis nach dem PHP-Commit (C1 ausgerollt): Rest nur nginx/Views/CSS -> quick" "quick=true" \
+expect "Basis nach dem PHP-Commit (C1 ausgerollt): Rest enthält nginx.conf (wird nicht ausgerollt) -> full" "quick=false" \
   "$(run_check "QUICK_DEPLOY_BASIS=$C1" app)"
+expect "Basis nach nginx.conf (C2 ausgerollt): Rest nur Views/CSS -> quick" "quick=true" \
+  "$(run_check "QUICK_DEPLOY_BASIS=$C2" app)"
 expect "Basis = HEAD (Wiederholung desselben Commits) -> quick" "quick=true" \
   "$(run_check "QUICK_DEPLOY_BASIS=$C4" app)"
 expect "Vermerk fehlt (leere Ausgabe) -> full" "quick=false" "$(run_check "" app)"
@@ -114,6 +116,84 @@ run_check "QUICK_DEPLOY_BASIS=$C1" app > /dev/null
 grep -q 'nginx.conf hat sich geändert, wird aber NICHT ausgerollt' "$WORK/check.log" && ok "nginx.conf-Änderung: Lauf meldet, dass sie nicht ausgerollt wird" || fail "nginx.conf: keine ehrliche Meldung"
 run_check "QUICK_DEPLOY_BASIS=$C3" app > /dev/null
 grep -q 'nginx.conf' "$WORK/check.log" && fail "nginx-Hinweis ohne nginx-Änderung" || ok "ohne nginx.conf-Änderung kein nginx-Hinweis"
+
+echo "== detect-changes (Quick-Liste, fail closed)"
+# Je Fall ein eigenes Repo: Basis-Commit mit allen Dateien, zweiter Commit ändert/löscht/benennt um.
+# Zeilen: "M pfad", "A pfad", "D pfad", "R alt neu". Ausgabe: quick=... und Log in $WORK/check.log
+fc_case() { # aenderungen (zeilenweise)  [PUBLIC_VOLUME wird vererbt]
+  local dir="$WORK/fc" line st a b
+  rm -rf "$dir" "$WORK/fc-origin.git"
+  git init -q --bare -b main "$WORK/fc-origin.git"
+  git init -q -b main "$dir"
+  git -C "$dir" config user.email t@example.invalid
+  git -C "$dir" config user.name Test
+  git -C "$dir" config core.excludesFile /dev/null
+  git -C "$dir" remote add origin "$WORK/fc-origin.git"
+  local base_files="resources/views/a.blade.php lang/de/a.php resources/css/app.css resources/js/app.js public/build/x.js public/images/a.png docker/x.conf scripts/x.sh docker-entrypoint.sh docker-compose.yml Dockerfile resources/markdown/a.md public/favicon.ico README.md nginx.conf app/A.php"
+  local f
+  for f in $base_files; do mkdir -p "$dir/$(dirname "$f")"; echo v0 > "$dir/$f"; done
+  git -C "$dir" add -A; git -C "$dir" commit -q -m basis
+  local B; B=$(git -C "$dir" rev-parse HEAD)
+  while read -r st a b; do
+    [ -z "$st" ] && continue
+    case "$st" in
+      M) echo v1 >> "$dir/$a" ;;
+      A) mkdir -p "$dir/$(dirname "$a")"; echo neu > "$dir/$a" ;;
+      D) rm -f "$dir/$a" ;;
+      R) mkdir -p "$dir/$(dirname "$b")"; git -C "$dir" mv "$a" "$b" ;;
+    esac
+  done <<< "$1"
+  git -C "$dir" add -A; git -C "$dir" commit -q -m aenderung --allow-empty
+  git -C "$dir" push -q origin main
+  rm -rf "$WORK/runner"; git clone -q --depth 2 "file://$WORK/fc-origin.git" "$WORK/runner"
+  local out="$WORK/gh-output"; : > "$out"
+  local script="$WORK/check.sh"
+  INPUT_APP_CONTAINER=app "$EXTRACT" "$WF" detect-changes check > "$script" || { echo "EXTRAKTIONSFEHLER"; return; }
+  (cd "$WORK/runner" && GITHUB_OUTPUT="$out" APP_CONTAINER=app PUBLIC_VOLUME="${PUBLIC_VOLUME-/srv/public-volume}" BASIS_RAW="QUICK_DEPLOY_BASIS=$B" bash -e "$script" > "$WORK/check.log" 2>&1) || { echo "exit$?"; return; }
+  grep -E '^quick=' "$out" | tail -n 1
+}
+expect "nur docker/ -> full" "quick=false" "$(fc_case "M docker/x.conf")"
+grep -q 'Full build required due to: docker/x.conf' "$WORK/check.log" && ok "docker/: Log nennt die auslösende Datei" || fail "docker/: Log nennt die Datei nicht"
+expect "nur docker-entrypoint.sh -> full" "quick=false" "$(fc_case "M docker-entrypoint.sh")"
+expect "nur docker-compose.yml -> full" "quick=false" "$(fc_case "M docker-compose.yml")"
+expect "nur scripts/ -> full" "quick=false" "$(fc_case "M scripts/x.sh")"
+grep -q 'Full build required due to: scripts/x.sh' "$WORK/check.log" && ok "scripts/: Log nennt die auslösende Datei" || fail "scripts/: Log nennt die Datei nicht"
+expect "nur resources/js -> quick" "quick=true" "$(fc_case "M resources/js/app.js")"
+expect "nur resources/css -> quick" "quick=true" "$(fc_case "M resources/css/app.css")"
+expect "nur resources/views -> quick" "quick=true" "$(fc_case "M resources/views/a.blade.php")"
+expect "nur resources/ ohne views/css/js (markdown) -> full" "quick=false" "$(fc_case "M resources/markdown/a.md")"
+expect "nur public/images (geändert) -> quick" "quick=true" "$(fc_case "M public/images/a.png")"
+expect "nur public/images (neu) -> quick" "quick=true" "$(fc_case "A public/images/b.png")"
+expect "public/images gelöscht (Quick rollt Löschungen nicht aus) -> full" "quick=false" "$(fc_case "D public/images/a.png")"
+expect "nur public/build -> quick" "quick=true" "$(fc_case "M public/build/x.js")"
+expect "public/ sonst (favicon.ico) -> full" "quick=false" "$(fc_case "M public/favicon.ico")"
+expect "lang/ -> quick" "quick=true" "$(fc_case "M lang/de/a.php")"
+expect "letzte Datei in lang/ gelöscht (Verzeichnis weg, Upload entfällt) -> full" "quick=false" "$(fc_case "D lang/de/a.php")"
+expect "Wurzeldatei (README.md) -> full" "quick=false" "$(fc_case "M README.md")"
+expect "nginx.conf -> full" "quick=false" "$(fc_case "M nginx.conf")"
+expect "Dockerfile -> full" "quick=false" "$(fc_case "M Dockerfile")"
+expect "gemischt: views + docker/ -> full" "quick=false" "$(fc_case "M resources/views/a.blade.php
+M docker/x.conf")"
+expect "gemischt: views + css + js + images + lang -> quick" "quick=true" "$(fc_case "M resources/views/a.blade.php
+M resources/css/app.css
+M resources/js/app.js
+M public/images/a.png
+M lang/de/a.php")"
+expect "Umbenennung aus app/ heraus nach views (alter Pfad zählt) -> full" "quick=false" "$(fc_case "R app/A.php resources/views/b.blade.php")"
+expect "Umbenennung innerhalb views (alte View bliebe im Container, Quick kopiert nur additiv) -> full" "quick=false" "$(fc_case "R resources/views/a.blade.php resources/views/b.blade.php")"
+grep -q 'Full build required due to: resources/views/a.blade.php' "$WORK/check.log" && ok "Umbenennung: Log nennt den alten Pfad" || fail "Umbenennung: Log nennt den alten Pfad nicht"
+expect "View gelöscht -> full" "quick=false" "$(fc_case "D resources/views/a.blade.php")"
+expect "public/build-Datei gelöscht -> full" "quick=false" "$(fc_case "D public/build/x.js")"
+expect "css gelöscht -> full" "quick=false" "$(fc_case "D resources/css/app.css")"
+expect "Löschung gemischt mit Views-Änderung -> full" "quick=false" "$(fc_case "M resources/views/a.blade.php
+D public/images/a.png")"
+expect "leere Dateiliste (Rerun desselben Stands) -> quick" "quick=true" "$(fc_case "")"
+expect "ohne public-volume-path: resources/js -> full" "quick=false" "$(PUBLIC_VOLUME= fc_case "M resources/js/app.js")"
+grep -q 'kein public-volume-path' "$WORK/check.log" && ok "ohne public-volume-path: Log nennt den Grund" || fail "ohne public-volume-path: kein Grund im Log"
+expect "ohne public-volume-path: public/images -> full" "quick=false" "$(PUBLIC_VOLUME= fc_case "M public/images/a.png")"
+expect "ohne public-volume-path: nur views -> quick" "quick=true" "$(PUBLIC_VOLUME= fc_case "M resources/views/a.blade.php")"
+expect "Dateiname mit Umlaut unter views -> quick" "quick=true" "$(fc_case "A resources/views/über.blade.php")"
+expect "Dateiname mit Anführungszeichen (von git gequotet, nicht sicher einstufbar) -> full" "quick=false" "$(fc_case 'A resources/views/a"b.blade.php')"
 
 echo "== public/images-Guard"
 run_has_images() { # mit|ohne
