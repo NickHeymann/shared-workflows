@@ -138,12 +138,15 @@ Jetzt gilt ein Basis-Vermerk am Ziel (`<deploy-path>/.quick-deploy-basis`, nur b
   inzwischen geändert (Vermerk weg oder anders), bricht er rot ab, ohne etwas auszurollen. Er
   überschreibt nie einen Vermerk, den ein anderer Deploy inzwischen gesetzt hat. Der Full-Deploy
   löscht zusätzlich die Vermerke seiner Extra-Pfade.
-- Der gesamte schreibende Teil von Quick- und Full-Deploy läuft unter einer Sperre je
-  `deploy-path` (`flock` auf `<deploy-path>/.deploy.lock`, util-linux ist am Server vorhanden).
-  Ein zweiter Lauf wartet mit Frist (Quick 120 s, Full 300 s) und scheitert danach laut, er
-  läuft nie parallel. Die Sperre hält auch ein nach einem GitHub-Abbruch weiterlaufender
-  ssh-Prozess bis zu seinem Ende. Temporäre Vermerk-Dateien sind laufbezogen (`.tmp.<PID>`).
-- `detect-changes` liest ihn per ssh und diffet `Basis..HEAD`. Der Full-Deploy läuft (fail
+- Der gesamte schreibende Teil von Quick- und Full-Deploy läuft unter einer Sperre je Pfad
+  (`flock` auf `<pfad>/.deploy.lock`, util-linux ist am Server vorhanden). Der Full-Deploy sperrt
+  Hauptpfad und Extra-Pfade, sortiert (kein Verklemmen bei vertauschten Pfaden). Die Sperre hält
+  ein eigener Hilfsprozess, der endet, sobald das Deploy-Skript endet: Hintergrundprozesse aus
+  `pre-/post-deploy-commands` erben sie nicht. Ein zweiter Lauf wartet mit Frist (Quick 120 s,
+  Full 300 s je Pfad) und scheitert danach laut, er läuft nie parallel. Ein nach einem
+  GitHub-Abbruch weiterlaufendes Deploy-Skript hält die Sperre bis zu seinem Ende.
+  Temporäre Vermerk-Dateien sind laufbezogen (`.tmp.<PID>`).
+- `detect-changes` liest den Vermerk per ssh und diffet `Basis..HEAD`. Der Full-Deploy läuft (fail
   closed), wenn der Vermerk fehlt, kein 40-stelliger SHA ist, nicht lesbar ist oder der
   Basis-Commit nicht abrufbar ist. Folge: der erste Deploy nach der Umstellung auf eine Version
   mit Basis-Vermerk ist immer ein Full-Deploy (Vermerk fehlt noch), ebenso der Deploy nach jedem

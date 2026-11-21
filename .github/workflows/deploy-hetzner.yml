@@ -327,15 +327,29 @@ jobs:
             VOLUME="${{ inputs.public-volume-path }}"
             BASIS_FILE="${{ inputs.deploy-path }}/.quick-deploy-basis"
 
-            # Sperre je deploy-path (flock, Datei .deploy.lock): der gesamte schreibende Teil
-            # läuft nie parallel zu einem anderen Quick- oder Full-Deploy desselben Pfads, auch
-            # dann nicht, wenn GitHub einen Lauf abbricht und dessen ssh-Prozess am Ziel
-            # weiterläuft (er hält die Sperre bis zu seinem Ende). Ein zweiter Lauf wartet mit
-            # Frist und scheitert danach laut. Die Sperre hängt am Dateideskriptor 9 und endet
-            # mit dem Skript.
-            exec 9>"${{ inputs.deploy-path }}/.deploy.lock"
-            if ! flock -w 120 9; then
-              echo "::error::Deploy-Sperre ${{ inputs.deploy-path }}/.deploy.lock nach 120 Sekunden nicht erhalten (anderer Deploy läuft noch). Nichts ausgerollt."
+            # Sperre je Pfad (flock auf <pfad>/.deploy.lock, util-linux): der gesamte schreibende
+            # Teil läuft nie parallel zu einem anderen Quick- oder Full-Deploy desselben Pfads,
+            # auch dann nicht, wenn GitHub einen Lauf abbricht und dessen ssh-Prozess am Ziel
+            # weiterläuft (er hält die Sperre bis zu seinem Ende). Die Sperre hält ein eigener
+            # Hilfsprozess, der endet, sobald dieses Skript endet. So erbt kein Kindprozess des
+            # Skripts (auch nicht aus pre-/post-deploy-commands) die Sperre. Ein zweiter Lauf
+            # wartet mit Frist und scheitert danach laut.
+            acquire_deploy_lock() { # pfad frist-in-sekunden
+              local lp="$1" wait_s="$2" ok holder
+              ok=$(mktemp)
+              rm -f "$ok"
+              flock -w "$wait_s" "$lp/.deploy.lock" sh -c 'echo gesperrt > "$1"; while kill -0 "$2" 2>/dev/null; do sleep 1; done' sh "$ok" "$$" >/dev/null 2>&1 &
+              holder=$!
+              while [ ! -s "$ok" ]; do
+                if ! kill -0 "$holder" 2>/dev/null && [ ! -s "$ok" ]; then
+                  echo "::error::Deploy-Sperre $lp/.deploy.lock nach $wait_s Sekunden nicht erhalten (anderer Deploy läuft noch). Nichts ausgerollt."
+                  return 1
+                fi
+                sleep 0.2
+              done
+              rm -f "$ok"
+            }
+            if ! acquire_deploy_lock "${{ inputs.deploy-path }}" 120; then
               exit 1
             fi
 
@@ -669,20 +683,44 @@ jobs:
               fi
             }
 
+            # Sperre je Pfad (flock auf <pfad>/.deploy.lock, util-linux): der gesamte schreibende
+            # Teil läuft nie parallel zu einem anderen Quick- oder Full-Deploy desselben Pfads,
+            # auch dann nicht, wenn GitHub einen Lauf abbricht und dessen ssh-Prozess am Ziel
+            # weiterläuft (er hält die Sperre bis zu seinem Ende). Die Sperre hält ein eigener
+            # Hilfsprozess, der endet, sobald dieses Skript endet. So erbt kein Kindprozess des
+            # Skripts (auch nicht aus pre-/post-deploy-commands) die Sperre. Ein zweiter Lauf
+            # wartet mit Frist und scheitert danach laut.
+            acquire_deploy_lock() { # pfad frist-in-sekunden
+              local lp="$1" wait_s="$2" ok holder
+              ok=$(mktemp)
+              rm -f "$ok"
+              flock -w "$wait_s" "$lp/.deploy.lock" sh -c 'echo gesperrt > "$1"; while kill -0 "$2" 2>/dev/null; do sleep 1; done' sh "$ok" "$$" >/dev/null 2>&1 &
+              holder=$!
+              while [ ! -s "$ok" ]; do
+                if ! kill -0 "$holder" 2>/dev/null && [ ! -s "$ok" ]; then
+                  echo "::error::Deploy-Sperre $lp/.deploy.lock nach $wait_s Sekunden nicht erhalten (anderer Deploy läuft noch). Nichts ausgerollt."
+                  return 1
+                fi
+                sleep 0.2
+              done
+              rm -f "$ok"
+            }
+
             cd "${{ inputs.deploy-path }}"
 
             # Basis-Vermerk ungültig machen, BEVOR das Ziel verändert wird (nur bei Repos
             # mit Quick-Deploy). Er wird erst nach vollständigem Erfolg neu geschrieben;
             # bricht der Deploy dazwischen ab, fällt der nächste Lauf auf Full-Deploy zurück.
             if [ -n "${{ inputs.app-container }}" ]; then
-              # Sperre je deploy-path (siehe Quick-Deploy): kein Quick- oder Full-Deploy
-              # desselben Pfads läuft parallel; ein zweiter Lauf wartet mit Frist und
-              # scheitert danach laut. Hängt am Dateideskriptor 9 bis zum Skriptende.
-              exec 9>"${{ inputs.deploy-path }}/.deploy.lock"
-              if ! flock -w 300 9; then
-                echo "::error::Deploy-Sperre ${{ inputs.deploy-path }}/.deploy.lock nach 300 Sekunden nicht erhalten (anderer Deploy läuft noch). Nichts ausgerollt."
-                exit 1
-              fi
+              # Sperre für den Hauptpfad UND alle Extra-Pfade, damit auch dort kein Quick- oder
+              # Full-Deploy parallel läuft. Die Pfade werden sortiert gesperrt (einheitliche
+              # Reihenfolge, kein Verklemmen zweier Läufe mit vertauschten Haupt- und Extra-Pfaden).
+              LOCK_PATHS=$(printf '%s\n%s\n' "${{ inputs.deploy-path }}" "${{ inputs.extra-deploy-paths }}" | xargs -n1 | LC_ALL=C sort -u)
+              for lock_path in $LOCK_PATHS; do
+                if ! acquire_deploy_lock "$lock_path" 300; then
+                  exit 1
+                fi
+              done
               rm -f "${{ inputs.deploy-path }}/.quick-deploy-basis" "${{ inputs.deploy-path }}/.quick-deploy-basis".tmp.*
             fi
             # Extra-Pfade bekommen ebenfalls neuen Code: ein eigener Vermerk dort (der Pfad

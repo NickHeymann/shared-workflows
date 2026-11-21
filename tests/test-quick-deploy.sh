@@ -115,7 +115,7 @@ cat > "$BIN/docker" <<'FAKE'
 echo "docker $*" >> "$FAKE_LOG"
 if [ -n "${FAKE_EVENTS:-}" ]; then   # Ereignisprotokoll fuer den Gleichzeitigkeitstest
   s="${FAKE_SLEEP:-0}"
-  [ "$1 $2" = "compose pull" ] && { echo full-start >> "$FAKE_EVENTS"; sleep "$s"; }
+  [ "$1 $2" = "compose pull" ] && [ ! -e "$FAKE_EVENTS.s${FAKE_RUN:-}" ] && { : > "$FAKE_EVENTS.s${FAKE_RUN:-}"; echo full-start >> "$FAKE_EVENTS"; sleep "$s"; }
   [ "$1 $2" = "compose up" ] && { sleep "$s"; echo "$FAKE_LABEL" > "$FAKE_STATE"; }
   [ "$1 $2" = "image prune" ] && echo full-end >> "$FAKE_EVENTS"
   [ "$1" = "cp" ] && [ ! -e "$FAKE_EVENTS.q" ] && { : > "$FAKE_EVENTS.q"; echo quick-start >> "$FAKE_EVENTS"; sleep "$s"; echo "quick-views" > "$FAKE_STATE.views"; }
@@ -148,21 +148,27 @@ shift; exec "$@"
 FAKE
 cat > "$BIN/flock" <<'FAKE'
 #!/usr/bin/env python3
-# Attrappe fuer util-linux flock (nur "flock [-w SEK] FD"), weil macOS kein flock hat.
-import fcntl, sys, time
+# Attrappe fuer util-linux flock ("flock [-w SEK] FD" und "flock [-w SEK] DATEI BEFEHL..."), weil macOS kein flock hat.
+import fcntl, os, subprocess, sys, time
 a = sys.argv[1:]; w = None
 if a and a[0] == "-w": w = float(a[1]); a = a[2:]
-fd = int(a[0]); end = time.time() + (w if w is not None else 1e9)
+if a[0].isdigit():
+    fd = int(a[0]); cmd = None
+else:
+    fd = os.open(a[0], os.O_RDWR | os.O_CREAT, 0o644); cmd = a[1:]
+end = time.time() + (w if w is not None else 1e9)
 while True:
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB); sys.exit(0)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        sys.exit(subprocess.call(cmd, close_fds=True) if cmd else 0)
     except OSError:
         if time.time() >= end: sys.exit(1)
         time.sleep(0.05)
 FAKE
 chmod +x "$BIN"/*
 # Rotprobe-Schalter: TEST_NOLOCK=1 entfernt die Sperre aus den Skripten
-nolock() { if [ -n "${TEST_NOLOCK:-}" ]; then sed -E 's/flock -w [0-9]+ 9/true/'; else cat; fi; }
+nolock() { if [ -n "${TEST_NOLOCK:-}" ]; then sed -E 's/flock -w "\$wait_s" "\$lp\/.deploy.lock" //'; else cat; fi; }
+shortwait() { sed -E 's/(acquire_deploy_lock "[^"]*") [0-9]+/\1 1/'; }
 
 SHA_VALUE="$C4"
 OTHER="1111111111111111111111111111111111111111"   # Revision eines anderen Laufs im Image-Label
@@ -274,18 +280,57 @@ conc_setup
 ( exec 9>"$SERVER/app/.deploy.lock"; PATH="$BIN:$PATH" flock 9; sleep 4 ) &
 PID_H=$!
 sleep 0.5
-sed -E 's/flock -w [0-9]+ 9/flock -w 1 9/' "$WORK/c-apply.sh" > "$WORK/c-apply-kurz.sh"
+shortwait < "$WORK/c-apply.sh" > "$WORK/c-apply-kurz.sh"
 conc_env EXPECTED_BASE="$C1" OPCACHE_RESET_URL=x DEPLOY_TOKEN=t HAS_IMAGES=false bash -e "$WORK/c-apply-kurz.sh" > "$WORK/c-apply.out" 2>&1; RC=$?
 if [ -n "${TEST_NOLOCK:-}" ]; then fail "Frist (ohne Sperre nicht prüfbar)"; else
 [ "$RC" -ne 0 ] && grep -q 'Deploy-Sperre' "$WORK/c-apply.out" && ok "Quick: Sperre nicht erhalten -> laute Fehlermeldung, Exit $RC" || fail "Quick: kein lauter Fehler bei gehaltener Sperre (Exit $RC)"
 expect "Quick: ... nichts ausgerollt" "0" "$(grep -c '^docker cp' "$WORK/fake.log")"
 expect "Quick: ... Vermerk unverändert" "$C1" "$(marker "$SERVER/app")"
-sed -E 's/flock -w [0-9]+ 9/flock -w 1 9/' "$WORK/c-full.sh" > "$WORK/c-full-kurz.sh"
+shortwait < "$WORK/c-full.sh" > "$WORK/c-full-kurz.sh"
 conc_env GHCR_TOKEN=x bash "$WORK/c-full-kurz.sh" > "$WORK/c-full.out" 2>&1; RC=$?
 [ "$RC" -ne 0 ] && grep -q 'Deploy-Sperre' "$WORK/c-full.out" && ok "Full: Sperre nicht erhalten -> laute Fehlermeldung, Exit $RC" || fail "Full: kein lauter Fehler bei gehaltener Sperre (Exit $RC)"
 expect "Full: ... nichts ausgerollt (kein compose pull)" "0" "$(grep -c 'compose pull' "$WORK/fake.log")"
 fi
 wait "$PID_H" 2>/dev/null
+
+# Sperr-Deskriptoren werden nicht an Hintergrundprozesse aus pre-deploy-commands vererbt
+genfull() { # main extra pre -> $WORK/g-full.sh
+  INPUT_DEPLOY_PATH="$1" INPUT_APP_CONTAINER=app GITHUB_SHA_VALUE="$SHA_VALUE" INPUT_STATEFUL_SERVICES="redis" INPUT_PRE_DEPLOY_COMMANDS="$3" INPUT_POST_DEPLOY_COMMANDS="$3" INPUT_EXTRA_DEPLOY_PATHS="$2" \
+    "$EXTRACT" "$WF" full-deploy "Deploy to Hetzner" --key script | nolock > "$4"
+}
+conc_setup
+genfull "$SERVER/app" "" "sleep 6 &" "$WORK/g-full.sh"
+conc_env GHCR_TOKEN=x bash "$WORK/g-full.sh" > "$WORK/g-full.out" 2>&1; RC=$?
+expect "Full mit Hintergrundprozess in pre/post-deploy-commands: Exit 0" "0" "$RC"
+( exec 9>"$SERVER/app/.deploy.lock"; PATH="$BIN:$PATH" flock -w 4 9 ); RC=$?
+if [ -n "${TEST_NOLOCK:-}" ]; then :; else expect "Sperre ist nach dem Skriptende frei, obwohl ein Hintergrundprozess weiterläuft" "0" "$RC"; fi
+
+# Extra-Pfade werden mitgesperrt
+conc_setup; mkdir -p "$SERVER/staging"
+( exec 9>"$SERVER/staging/.deploy.lock"; PATH="$BIN:$PATH" flock 9; sleep 4 ) &
+PID_H=$!
+sleep 0.5
+genfull "$SERVER/app" "$SERVER/staging" "" "$WORK/g-full.sh"
+shortwait < "$WORK/g-full.sh" > "$WORK/g-full-kurz.sh"
+conc_env GHCR_TOKEN=x bash "$WORK/g-full-kurz.sh" > "$WORK/g-full.out" 2>&1; RC=$?
+if [ -z "${TEST_NOLOCK:-}" ]; then
+[ "$RC" -ne 0 ] && grep -q 'staging/.deploy.lock' "$WORK/g-full.out" && ok "Extra-Pfad gesperrt gehalten -> Full scheitert laut mit dem Pfad in der Meldung" || fail "Extra-Pfad-Sperre wird nicht beachtet (Exit $RC)"
+expect "... nichts ausgerollt (kein compose pull)" "0" "$(grep -c 'compose pull' "$WORK/fake.log")"
+fi
+wait "$PID_H" 2>/dev/null
+
+# Zwei Full-Deploys mit vertauschten Haupt- und Extra-Pfaden verklemmen nicht und laufen nacheinander
+conc_setup; mkdir -p "$SERVER/staging"
+genfull "$SERVER/app" "$SERVER/staging" "" "$WORK/g-full-1.sh"
+genfull "$SERVER/staging" "$SERVER/app" "" "$WORK/g-full-2.sh"
+( conc_env FAKE_RUN=1 GHCR_TOKEN=x bash "$WORK/g-full-1.sh" > "$WORK/g1.out" 2>&1; echo $? > "$WORK/g1.rc" ) &
+P1=$!
+( conc_env FAKE_RUN=2 GHCR_TOKEN=x bash "$WORK/g-full-2.sh" > "$WORK/g2.out" 2>&1; echo $? > "$WORK/g2.rc" ) &
+P2=$!
+wait "$P1" "$P2"
+expect "vertauschte Haupt-/Extra-Pfade: beide Läufe enden mit Exit 0 (keine Verklemmung)" "0 0" "$(cat "$WORK/g1.rc") $(cat "$WORK/g2.rc")"
+OVERLAP=$(awk '/-start/{d++; if(d>1) bad=1} /-end/{d--} END{print bad?"ueberlappt":"getrennt"}' "$WORK/events")
+expect "vertauschte Haupt-/Extra-Pfade: Läufe überlappen nicht" "getrennt" "$OVERLAP"
 
 echo "== Build-Label"
 BUILD_LABEL=$(ruby -ryaml -e 'wf=YAML.load_file(ARGV[0]); s=wf["jobs"]["full-deploy"]["steps"].find{|x| x["name"]=="Build and push Docker image"}; puts s["with"]["labels"]' "$WF")
