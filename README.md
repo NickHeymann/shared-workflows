@@ -115,6 +115,22 @@ behalten das alte Verhalten.
 Der Quick-Deploy (Views, Sprachdateien, CSS/JS, Bilder ohne Image-Build) ist nur aktiv,
 wenn das Repo `app-container` setzt.
 
+**Quick-Liste statt Full-Liste (fail closed).** `detect-changes` führt eine ausdrückliche Liste der
+Pfade, die der Quick-Deploy wirklich ausrollt. Quick ist ein Deploy nur, wenn jede geänderte Datei
+darauf steht, jede andere Datei (auch neue, unbekannte Pfade) führt zum Full-Deploy, und der Lauf
+nennt im Log die auslösende Datei (`Full build required due to: <datei> (<grund>)`):
+- `resources/views/**` (rsync, `docker cp`), `lang/**` (nur wenn `lang/` im Stand existiert)
+- `resources/css/**`, `resources/js/**` (Eingaben des Vite-Builds) und `public/build/**`, jeweils nur
+  mit gesetztem `public-volume-path` (nur dann kopiert der Quick-Deploy `public/build` ans Ziel)
+- `public/images/**` nur mit `public-volume-path` und nur Neuanlagen und Änderungen (kopiert wird
+  additiv, Löschungen kämen nicht an)
+- Alles andere ist Full: `Dockerfile`, `docker/`, `docker-entrypoint.sh`, Compose-Dateien, `scripts/`,
+  `resources/` außer views, css und js, `public/` außer build und images, Wurzeldateien, `nginx.conf`
+  (wird auch vom Full-Deploy nicht ausgerollt, die Warnung bleibt). Folge: eine reine Doku-Änderung
+  (README) löst einen Full-Deploy aus.
+- Das Diff läuft mit `--no-renames` (Umbenennung zählt als Löschung plus Neuanlage, der alte Pfad wird
+  mitgeprüft). Eine leere Liste (Wiederholung desselben Commits) bleibt Quick.
+
 **Basis statt Vorgänger-Commit.** Früher verglich `detect-changes` nur `HEAD~1` mit `HEAD`.
 Brach `concurrency: cancel-in-progress` (oder ein Handabbruch, ein Fehlschlag) den Lauf
 für Commit A ab und der Folge-Commit B enthielt nur Views oder `nginx.conf`, übertrug der
