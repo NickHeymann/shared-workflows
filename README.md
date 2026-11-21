@@ -170,7 +170,7 @@ Jetzt gilt ein Basis-Vermerk am Ziel (`<deploy-path>/.quick-deploy-basis`, nur b
   Wiederholung oben als zweite Sicherung. Der Quick-Deploy zieht kein Deploy-Image und braucht die Sperre
   nicht. Grenze: die Schritte, die im Runner-Container laufen (Basis-Images `php`/`node` des Quick-Deploys,
   `alpine` des Build-Platzes), sehen die Sperre des Hosts nicht. Dort gilt nur die Wiederholung (Pull der
-  Basis-Images mit höchstens drei Versuchen bei `NotFound: content digest`). Eine vollständige Lösung
+  Basis-Images nur bei lokalem Fehlen, unmittelbar vor dem Start, mit höchstens drei Versuchen bei `NotFound: content digest`). Eine vollständige Lösung
   bräuchte `/run/lock` als Bind-Mount in den Runner-Containern (Serveränderung, offene Entscheidung).
 - `nginx.conf` wird von keinem der beiden Deploys ausgerollt (am Server von Hand gepflegt). Ändert
   sich die Datei, meldet der Lauf das als Warnung und in der Zusammenfassung, statt sie still als

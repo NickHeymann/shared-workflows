@@ -242,12 +242,14 @@ jobs:
           # `container: image: php:8.4-cli` -- hier dieselbe Idee, nur als
           # einzelner `docker run`-Schritt statt Job-Container, weil
           # spaetere Schritte (SSH-Deploy) auf dem Host laufen muessen.
-          # Basis-Images vorab holen, mit begrenzter Wiederholung beim NotFound-Fehler des
+          # Basis-Image nur holen, wenn es lokal fehlt (vorhandene Images brauchen keine Registry), und zwar
+          # unmittelbar vor seinem `docker run`, mit begrenzter Wiederholung beim NotFound-Fehler des
           # containerd-Speichers (gleichzeitiger docker image prune, moby/moby#53321). Der Runner
           # läuft in einem Container ohne Zugriff auf die Sperre des Hosts, deshalb gibt es hier nur
           # die Wiederholung als Sicherung, nicht die hostweite Sperre.
-          pull_base() {
+          ensure_image() {
             local img="$1" attempt=1 max=3 out rc
+            if docker image inspect "$img" >/dev/null 2>&1; then return 0; fi
             while :; do
               if out=$(docker pull "$img" 2>&1); then return 0; else rc=$?; fi
               printf '%s\n' "$out"
@@ -264,9 +266,8 @@ jobs:
               sleep "${PULL_RETRY_WAIT:-15}"
             done
           }
-          pull_base php:8.4-cli
-          pull_base "node:${NODE_VERSION}"
 
+          ensure_image php:8.4-cli
           docker run --rm -v "$PWD":/app -w /app php:8.4-cli sh -c '
             set -e
             export DEBIAN_FRONTEND=noninteractive
@@ -286,6 +287,7 @@ jobs:
           # stehende Fallback (`command -v npm` + NodeSource) installierte nichts,
           # weil apt das vorhandene Ubuntu-nodejs behielt -> "npm: command not
           # found". Gleiches Muster wie beim composer-Schritt oben.
+          ensure_image "node:${NODE_VERSION}"
           docker run --rm -v "$PWD":/app -w /app "node:${NODE_VERSION}" sh -c '
             set -e
             node -v; npm -v
