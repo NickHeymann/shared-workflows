@@ -113,6 +113,14 @@ cat > "$BIN/docker" <<'FAKE'
 #!/bin/bash
 # Attrappe: protokolliert Aufrufe, prueft den Vermerk zum Zeitpunkt der Aufrufe.
 echo "docker $*" >> "$FAKE_LOG"
+if [ -n "${FAKE_EVENTS:-}" ]; then   # Ereignisprotokoll fuer den Gleichzeitigkeitstest
+  s="${FAKE_SLEEP:-0}"
+  [ "$1 $2" = "compose pull" ] && { echo full-start >> "$FAKE_EVENTS"; sleep "$s"; }
+  [ "$1 $2" = "compose up" ] && { sleep "$s"; echo "$FAKE_LABEL" > "$FAKE_STATE"; }
+  [ "$1 $2" = "image prune" ] && echo full-end >> "$FAKE_EVENTS"
+  [ "$1" = "cp" ] && [ ! -e "$FAKE_EVENTS.q" ] && { : > "$FAKE_EVENTS.q"; echo quick-start >> "$FAKE_EVENTS"; sleep "$s"; echo "quick-views" > "$FAKE_STATE.views"; }
+  printf '%s ' "$@" | grep -q 'view:cache' && echo quick-end >> "$FAKE_EVENTS"
+fi
 case "$1 $2" in
   "compose pull"|"compose up") echo "marker-bei-$1-$2=$([ -e "$MARKER" ] && echo da || echo weg)" >> "$FAKE_LOG" ;;
 esac
@@ -138,7 +146,23 @@ cat > "$BIN/timeout" <<'FAKE'
 #!/bin/bash
 shift; exec "$@"
 FAKE
+cat > "$BIN/flock" <<'FAKE'
+#!/usr/bin/env python3
+# Attrappe fuer util-linux flock (nur "flock [-w SEK] FD"), weil macOS kein flock hat.
+import fcntl, sys, time
+a = sys.argv[1:]; w = None
+if a and a[0] == "-w": w = float(a[1]); a = a[2:]
+fd = int(a[0]); end = time.time() + (w if w is not None else 1e9)
+while True:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB); sys.exit(0)
+    except OSError:
+        if time.time() >= end: sys.exit(1)
+        time.sleep(0.05)
+FAKE
 chmod +x "$BIN"/*
+# Rotprobe-Schalter: TEST_NOLOCK=1 entfernt die Sperre aus den Skripten
+nolock() { if [ -n "${TEST_NOLOCK:-}" ]; then sed -E 's/flock -w [0-9]+ 9/true/'; else cat; fi; }
 
 SHA_VALUE="$C4"
 OTHER="1111111111111111111111111111111111111111"   # Revision eines anderen Laufs im Image-Label
@@ -149,7 +173,7 @@ run_quick() { # fail usr2fail curlcode vorhandener-vermerk -> schreibt $SERVER/a
   : > "$WORK/fake.log"
   INPUT_DEPLOY_PATH="$SERVER/app" INPUT_APP_CONTAINER=app INPUT_PUBLIC_VOLUME_PATH="" GITHUB_SHA_VALUE="$SHA_VALUE" \
     "$EXTRACT" "$WF" quick-deploy "Apply + clear caches" --key script \
-    | sed -e "s|/tmp/quick-deploy|$WORK/qd|g" -e "s|/tmp/opcache-reset.out|$WORK/opcache.out|g" > "$WORK/apply.sh"
+    | sed -e "s|/tmp/quick-deploy|$WORK/qd|g" -e "s|/tmp/opcache-reset.out|$WORK/opcache.out|g" | nolock > "$WORK/apply.sh"
   PATH="$BIN:$PATH" FAKE_LOG="$WORK/fake.log" MARKER="$SERVER/app/.quick-deploy-basis" FAKE_FAIL="$1" FAKE_USR2_FAIL="$2" FAKE_CURL_CODE="$3" \
     FAKE_CONCURRENT="${QUICK_CONCURRENT:-}" EXPECTED_BASE="${QUICK_EXPECTED-$4}" \
     OPCACHE_RESET_URL="https://x.invalid/reset" DEPLOY_TOKEN=t HAS_IMAGES=false \
@@ -187,7 +211,7 @@ run_full() { # fail label app-container vorhandener-vermerk  (FULL_EXTRA: Extra-
   [ -n "${FULL_EXTRA:-}" ] && echo "$C1" > "$SERVER/staging/.quick-deploy-basis"
   : > "$WORK/fake.log"
   INPUT_DEPLOY_PATH="$SERVER/app" INPUT_APP_CONTAINER="$3" GITHUB_SHA_VALUE="$SHA_VALUE" INPUT_STATEFUL_SERVICES="redis" INPUT_PRE_DEPLOY_COMMANDS="" INPUT_POST_DEPLOY_COMMANDS="" INPUT_EXTRA_DEPLOY_PATHS="${FULL_EXTRA:+$SERVER/staging}" \
-    "$EXTRACT" "$WF" full-deploy "Deploy to Hetzner" --key script > "$WORK/full.sh"
+    "$EXTRACT" "$WF" full-deploy "Deploy to Hetzner" --key script | nolock > "$WORK/full.sh"
   PATH="$BIN:$PATH" FAKE_LOG="$WORK/fake.log" MARKER="$SERVER/app/.quick-deploy-basis" FAKE_FAIL="$1" FAKE_LABEL="$2" GHCR_TOKEN=x \
     bash "$WORK/full.sh" > "$WORK/full.out" 2>&1
 }
@@ -215,6 +239,53 @@ run_full "" "$C4" "" "$C1"; RC=$?
 expect "Full ohne app-container: vorhandener Vermerk bleibt unberührt" "$C1" "$(marker "$SERVER/app")"
 run_full "" "$C4" "" ""; RC=$?
 expect "Full ohne app-container: kein Vermerk angelegt" "-" "$(marker "$SERVER/app")"
+
+echo "== Sperre je deploy-path (flock)"
+conc_setup() { # schreibt $WORK/c-apply.sh und $WORK/c-full.sh gegen $SERVER/app
+  SERVER="$WORK/server-conc"; rm -rf "$SERVER" "$WORK/qd"; mkdir -p "$SERVER/app" "$WORK/qd/resources/views" "$WORK/qd/lang" "$WORK/qd/public/build" "$WORK/qd/public/images"
+  echo "$C1" > "$SERVER/app/.quick-deploy-basis"
+  : > "$WORK/fake.log"; : > "$WORK/events"; rm -f "$WORK/events.q" "$WORK/state" "$WORK/state.views"
+  INPUT_DEPLOY_PATH="$SERVER/app" INPUT_APP_CONTAINER=app INPUT_PUBLIC_VOLUME_PATH="" GITHUB_SHA_VALUE="$SHA_VALUE" \
+    "$EXTRACT" "$WF" quick-deploy "Apply + clear caches" --key script \
+    | sed -e "s|/tmp/quick-deploy|$WORK/qd|g" -e "s|/tmp/opcache-reset.out|$WORK/opcache.out|g" | nolock > "$WORK/c-apply.sh"
+  INPUT_DEPLOY_PATH="$SERVER/app" INPUT_APP_CONTAINER=app GITHUB_SHA_VALUE="$SHA_VALUE" INPUT_STATEFUL_SERVICES="redis" INPUT_PRE_DEPLOY_COMMANDS="" INPUT_POST_DEPLOY_COMMANDS="" INPUT_EXTRA_DEPLOY_PATHS="" \
+    "$EXTRACT" "$WF" full-deploy "Deploy to Hetzner" --key script | nolock > "$WORK/c-full.sh"
+}
+conc_env() { PATH="$BIN:$PATH" FAKE_LOG="$WORK/fake.log" MARKER="$SERVER/app/.quick-deploy-basis" FAKE_EVENTS="$WORK/events" FAKE_STATE="$WORK/state" FAKE_SLEEP=1 FAKE_LABEL="$OTHER" env "$@"; }
+conc_setup
+# Quick (Basis C1) startet zuerst, der Full-Deploy mit anderer Revision kommt waehrend dessen dazu
+( conc_env EXPECTED_BASE="$C1" OPCACHE_RESET_URL="https://x.invalid/reset" DEPLOY_TOKEN=t HAS_IMAGES=false bash -e "$WORK/c-apply.sh" > "$WORK/c-apply.out" 2>&1; echo $? > "$WORK/c-apply.rc" ) &
+PID_Q=$!
+sleep 0.4
+( conc_env GHCR_TOKEN=x bash "$WORK/c-full.sh" > "$WORK/c-full.out" 2>&1; echo $? > "$WORK/c-full.rc" ) &
+PID_F=$!
+wait "$PID_Q" "$PID_F"
+# Ereignisse duerfen sich nie ueberlappen: auf "X-start" folgt sofort "X-end"
+OVERLAP=$(awk '/-start/{d++; if(d>1) bad=1} /-end/{d--} END{print bad?"ueberlappt":"getrennt"}' "$WORK/events")
+expect "zwei gleichzeitige Läufe (Quick und Full) überlappen nie" "getrennt" "$OVERLAP"
+expect "Full-Deploy lief durch (Exit 0)" "0" "$(cat "$WORK/c-full.rc")"
+FINAL="$(marker "$SERVER/app")"
+if [ "$FINAL" = "-" ] || [ "$FINAL" = "$OTHER" ]; then ok "Vermerk passt zum ausgerollten Stand (leer oder Revision des Full-Deploys: $([ "$FINAL" = "-" ] && echo leer || echo Revision))"; else fail "Vermerk $FINAL passt nicht zum Stand (PHP aus $(cat "$WORK/state" 2>/dev/null))"; fi
+expect "der Stand am Ziel ist der des Full-Deploys" "$OTHER" "$(cat "$WORK/state" 2>/dev/null)"
+ls "$SERVER/app" | grep -q 'tmp' && fail "temporäre Vermerk-Dateien übrig" || ok "keine temporären Vermerk-Dateien übrig"
+
+# Frist: ein zweiter Lauf scheitert laut, wenn die Sperre gehalten wird
+conc_setup
+( exec 9>"$SERVER/app/.deploy.lock"; PATH="$BIN:$PATH" flock 9; sleep 4 ) &
+PID_H=$!
+sleep 0.5
+sed -E 's/flock -w [0-9]+ 9/flock -w 1 9/' "$WORK/c-apply.sh" > "$WORK/c-apply-kurz.sh"
+conc_env EXPECTED_BASE="$C1" OPCACHE_RESET_URL=x DEPLOY_TOKEN=t HAS_IMAGES=false bash -e "$WORK/c-apply-kurz.sh" > "$WORK/c-apply.out" 2>&1; RC=$?
+if [ -n "${TEST_NOLOCK:-}" ]; then fail "Frist (ohne Sperre nicht prüfbar)"; else
+[ "$RC" -ne 0 ] && grep -q 'Deploy-Sperre' "$WORK/c-apply.out" && ok "Quick: Sperre nicht erhalten -> laute Fehlermeldung, Exit $RC" || fail "Quick: kein lauter Fehler bei gehaltener Sperre (Exit $RC)"
+expect "Quick: ... nichts ausgerollt" "0" "$(grep -c '^docker cp' "$WORK/fake.log")"
+expect "Quick: ... Vermerk unverändert" "$C1" "$(marker "$SERVER/app")"
+sed -E 's/flock -w [0-9]+ 9/flock -w 1 9/' "$WORK/c-full.sh" > "$WORK/c-full-kurz.sh"
+conc_env GHCR_TOKEN=x bash "$WORK/c-full-kurz.sh" > "$WORK/c-full.out" 2>&1; RC=$?
+[ "$RC" -ne 0 ] && grep -q 'Deploy-Sperre' "$WORK/c-full.out" && ok "Full: Sperre nicht erhalten -> laute Fehlermeldung, Exit $RC" || fail "Full: kein lauter Fehler bei gehaltener Sperre (Exit $RC)"
+expect "Full: ... nichts ausgerollt (kein compose pull)" "0" "$(grep -c 'compose pull' "$WORK/fake.log")"
+fi
+wait "$PID_H" 2>/dev/null
 
 echo "== Build-Label"
 BUILD_LABEL=$(ruby -ryaml -e 'wf=YAML.load_file(ARGV[0]); s=wf["jobs"]["full-deploy"]["steps"].find{|x| x["name"]=="Build and push Docker image"}; puts s["with"]["labels"]' "$WF")

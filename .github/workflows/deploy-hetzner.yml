@@ -327,13 +327,25 @@ jobs:
             VOLUME="${{ inputs.public-volume-path }}"
             BASIS_FILE="${{ inputs.deploy-path }}/.quick-deploy-basis"
 
+            # Sperre je deploy-path (flock, Datei .deploy.lock): der gesamte schreibende Teil
+            # läuft nie parallel zu einem anderen Quick- oder Full-Deploy desselben Pfads, auch
+            # dann nicht, wenn GitHub einen Lauf abbricht und dessen ssh-Prozess am Ziel
+            # weiterläuft (er hält die Sperre bis zu seinem Ende). Ein zweiter Lauf wartet mit
+            # Frist und scheitert danach laut. Die Sperre hängt am Dateideskriptor 9 und endet
+            # mit dem Skript.
+            exec 9>"${{ inputs.deploy-path }}/.deploy.lock"
+            if ! flock -w 120 9; then
+              echo "::error::Deploy-Sperre ${{ inputs.deploy-path }}/.deploy.lock nach 120 Sekunden nicht erhalten (anderer Deploy läuft noch). Nichts ausgerollt."
+              exit 1
+            fi
+
             # Basis-Vermerk beanspruchen UND ungültig machen, BEVOR das Ziel verändert wird:
             # bricht dieser Lauf ab (cancel, Fehler), gilt kein veralteter Vermerk weiter,
             # und der nächste Deploy fällt auf Full-Deploy zurück. Das Umbenennen ist atomar:
             # hat ein anderer Deploy den Vermerk inzwischen gelöscht oder ersetzt (Stand am
             # Ziel nicht mehr der, auf dem detect-changes entschieden hat), bricht dieser
             # Quick-Deploy ab, ohne etwas zu verändern.
-            rm -f "$BASIS_FILE.tmp" "$BASIS_FILE.claimed"
+            rm -f "$BASIS_FILE".tmp.* "$BASIS_FILE.claimed"
             if ! mv "$BASIS_FILE" "$BASIS_FILE.claimed"; then
               echo "::error::Basis-Vermerk nicht mehr vorhanden, Stand am Ziel hat sich geändert. Nichts ausgerollt, nächster Deploy ist ein Full-Deploy."
               exit 1
@@ -408,17 +420,18 @@ jobs:
             # Basis-Vermerk erst jetzt, nach vollständig erfolgreichem Ausrollen (set -e):
             # der nächste Quick-Deploy diffte gegen diesen Stand. Ohne geglückten
             # OPcache-Reset gilt der Stand nicht als ausgerollt (kein Vermerk, nächster
-            # Deploy ist ein Full-Deploy). Atomar über .tmp + mv.
+            # Deploy ist ein Full-Deploy). Atomar über eine laufbezogene .tmp-Datei.
             if [ "$RESET_FAILED" = "1" ]; then
               echo "WARN: Basis-Vermerk nicht geschrieben (OPcache-Reset fehlgeschlagen), nächster Deploy ist ein Full-Deploy"
             else
-              printf '%s\n' "${{ github.sha }}" > "$BASIS_FILE.tmp"
+              BASIS_TMP="$BASIS_FILE.tmp.$$"
+              printf '%s\n' "${{ github.sha }}" > "$BASIS_TMP"
               # ln schlägt fehl, wenn inzwischen ein anderer Deploy einen Vermerk geschrieben
               # hat (dessen Stand gilt dann, ein Quick-Deploy überschreibt nie einen Full-Deploy).
-              if ln "$BASIS_FILE.tmp" "$BASIS_FILE"; then
-                rm -f "$BASIS_FILE.tmp"
+              if ln "$BASIS_TMP" "$BASIS_FILE"; then
+                rm -f "$BASIS_TMP"
               else
-                rm -f "$BASIS_FILE.tmp"
+                rm -f "$BASIS_TMP"
                 echo "WARN: Basis-Vermerk von einem anderen Deploy gesetzt, bleibt bestehen"
               fi
             fi
@@ -662,14 +675,22 @@ jobs:
             # mit Quick-Deploy). Er wird erst nach vollständigem Erfolg neu geschrieben;
             # bricht der Deploy dazwischen ab, fällt der nächste Lauf auf Full-Deploy zurück.
             if [ -n "${{ inputs.app-container }}" ]; then
-              rm -f "${{ inputs.deploy-path }}/.quick-deploy-basis" "${{ inputs.deploy-path }}/.quick-deploy-basis.tmp"
+              # Sperre je deploy-path (siehe Quick-Deploy): kein Quick- oder Full-Deploy
+              # desselben Pfads läuft parallel; ein zweiter Lauf wartet mit Frist und
+              # scheitert danach laut. Hängt am Dateideskriptor 9 bis zum Skriptende.
+              exec 9>"${{ inputs.deploy-path }}/.deploy.lock"
+              if ! flock -w 300 9; then
+                echo "::error::Deploy-Sperre ${{ inputs.deploy-path }}/.deploy.lock nach 300 Sekunden nicht erhalten (anderer Deploy läuft noch). Nichts ausgerollt."
+                exit 1
+              fi
+              rm -f "${{ inputs.deploy-path }}/.quick-deploy-basis" "${{ inputs.deploy-path }}/.quick-deploy-basis".tmp.*
             fi
             # Extra-Pfade bekommen ebenfalls neuen Code: ein eigener Vermerk dort (der Pfad
             # kann auch Hauptpfad eines anderen Deploys sein) darf nicht gültig bleiben.
             printf '%s\n' "${{ inputs.extra-deploy-paths }}" | while IFS= read -r extra; do
               extra=$(echo "$extra" | xargs)
               if [ -n "$extra" ]; then
-                rm -f "$extra/.quick-deploy-basis" "$extra/.quick-deploy-basis.tmp"
+                rm -f "$extra/.quick-deploy-basis" "$extra"/.quick-deploy-basis.tmp.*
               fi
             done
 
@@ -702,14 +723,15 @@ jobs:
             # Full-Deploy zurück, wenn er fehlt. Der Wert ist die Revision aus dem Label
             # des laufenden App-Containers (an das tatsächlich gestartete Image gebunden),
             # nicht github.sha; fehlt oder ungültig, bleibt der Vermerk weg (fail closed).
-            # Atomar über .tmp + mv. Nur bei Repos mit Quick-Deploy (app-container).
+            # Atomar über eine laufbezogene .tmp-Datei. Nur bei Repos mit Quick-Deploy.
             if [ -n "${{ inputs.app-container }}" ]; then
               if ! REVISION=$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "${{ inputs.app-container }}"); then
                 REVISION=""
               fi
               if printf '%s' "$REVISION" | grep -qE '^[0-9a-f]{40}$'; then
-                printf '%s\n' "$REVISION" > "${{ inputs.deploy-path }}/.quick-deploy-basis.tmp"
-                mv "${{ inputs.deploy-path }}/.quick-deploy-basis.tmp" "${{ inputs.deploy-path }}/.quick-deploy-basis"
+                BASIS_TMP="${{ inputs.deploy-path }}/.quick-deploy-basis.tmp.$$"
+                printf '%s\n' "$REVISION" > "$BASIS_TMP"
+                mv "$BASIS_TMP" "${{ inputs.deploy-path }}/.quick-deploy-basis"
                 echo "Basis-Vermerk: $REVISION"
               else
                 echo "::warning::Image-Revision des Containers ${{ inputs.app-container }} nicht lesbar, kein Basis-Vermerk (nächster Deploy ist ein Full-Deploy)"
