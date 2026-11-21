@@ -74,24 +74,75 @@ jobs:
     runs-on: ${{ inputs.runner }}
     outputs:
       quick: ${{ steps.check.outputs.quick }}
+      base: ${{ steps.check.outputs.base }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 2
 
+      # Basis des Quick-Deploys: der zuletzt VOLLSTÄNDIG ausgerollte Commit, vom Ziel
+      # selbst gemeldet (Datei <deploy-path>/.quick-deploy-basis, geschrieben erst nach
+      # erfolgreichem Ausrollen). Das Diff gegen den Vorgänger-Commit (HEAD~1) verlor
+      # Änderungen, wenn ein Lauf abgebrochen wurde (concurrency cancel-in-progress,
+      # Handabbruch, Fehlschlag): der Folge-Commit übertrug nur sein eigenes Diff.
+      # continue-on-error: ein nicht lesbarer Vermerk führt zum Full-Deploy (fail closed),
+      # nicht zu einem roten Lauf.
+      - name: Read last deployed basis from server
+        id: basis
+        if: inputs.app-container != ''
+        continue-on-error: true
+        uses: appleboy/ssh-action@v1.2.5
+        with:
+          host: 46.224.6.69
+          username: root
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          timeout: 30s
+          command_timeout: 1m
+          capture_stdout: true
+          script: |
+            BASIS_FILE="${{ inputs.deploy-path }}/.quick-deploy-basis"
+            if [ -f "$BASIS_FILE" ]; then
+              echo "QUICK_DEPLOY_BASIS=$(head -n 1 "$BASIS_FILE" | tr -d '[:space:]')"
+            fi
+
       - name: Check changed files
         id: check
+        env:
+          APP_CONTAINER: ${{ inputs.app-container }}
+          BASIS_RAW: ${{ steps.basis.outputs.stdout }}
         run: |
-          CHANGED=$(git diff --name-only HEAD~1 HEAD)
-          echo "Changed files:"
-          echo "$CHANGED"
-
           # Quick deploy only possible if app-container is configured
-          if [ -z "${{ inputs.app-container }}" ]; then
+          if [ -z "$APP_CONTAINER" ]; then
             echo "quick=false" >> "$GITHUB_OUTPUT"
             echo "Quick deploy disabled (no app-container configured)"
             exit 0
           fi
+
+          full_deploy() {
+            echo "quick=false" >> "$GITHUB_OUTPUT"
+            echo "Full Docker build required: $1"
+            exit 0
+          }
+
+          # Basis = zuletzt vollständig ausgerollter Commit laut Server. Fehlt er, ist er
+          # ungültig oder nicht abrufbar, läuft der Full-Deploy (fail closed).
+          BASE=$(printf '%s\n' "$BASIS_RAW" | sed -n 's/^QUICK_DEPLOY_BASIS=//p' | tail -n 1 | tr -d '[:space:]')
+          if ! printf '%s' "$BASE" | grep -qE '^[0-9a-f]{40}$'; then
+            full_deploy "kein gültiger Basis-Vermerk am Server (erster Deploy mit Basis-Prüfung oder Lesefehler)"
+          fi
+          if ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=1 origin "$BASE" 2>/dev/null || true
+          fi
+          if ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            full_deploy "Basis-Commit $BASE nicht abrufbar"
+          fi
+          if ! CHANGED=$(git diff --name-only "$BASE" HEAD); then
+            full_deploy "Diff gegen Basis $BASE fehlgeschlagen"
+          fi
+          echo "Basis (zuletzt ausgerollt): $BASE"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "Changed files since basis:"
+          echo "$CHANGED"
 
           # Full rebuild required for these file types
           FULL_PATTERN="^(Dockerfile|composer\.(json|lock)|package(-lock)?\.json|vite\.config\.[jt]s|tailwind\.config\.[jt]s|\.github/|app/|config/|database/|routes/|bootstrap/)"
@@ -181,7 +232,7 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           timeout: 30s
           command_timeout: 2m
-          script: mkdir -p /tmp/quick-deploy/resources/views /tmp/quick-deploy/lang /tmp/quick-deploy/public/build /tmp/quick-deploy/public/images
+          script: mkdir -p /tmp/quick-deploy/resources/views /tmp/quick-deploy/lang /tmp/quick-deploy/public/build
 
       - name: Upload views
         uses: burnett01/rsync-deployments@7.0.1
@@ -229,9 +280,22 @@ jobs:
           remote_user: root
           remote_key: ${{ secrets.SSH_PRIVATE_KEY }}
 
+      # public/images/ — only some projects track this dir in git (master-admin does
+      # not). rsync without an existing source path fails the whole quick deploy, so
+      # guard it like lang/.
+      - name: Check for public/images directory
+        id: has-images
+        run: |
+          if [ -d public/images ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       # public/images/ — additive sync (NO --delete: images may also be
       # uploaded via admin/CMS at runtime; we must not wipe those).
       - name: Upload public images
+        if: steps.has-images.outputs.exists == 'true'
         uses: burnett01/rsync-deployments@7.0.1
         with:
           switches: -az
@@ -246,19 +310,78 @@ jobs:
         env:
           OPCACHE_RESET_URL: ${{ inputs.opcache-reset-url }}
           DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+          HAS_IMAGES: ${{ steps.has-images.outputs.exists }}
+          EXPECTED_BASE: ${{ needs.detect-changes.outputs.base }}
         with:
           host: 46.224.6.69
           username: root
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           # OPCACHE_RESET_URL + DEPLOY_TOKEN via envs (NOT interpolated into the
           # script string) so the token never lands in the command line / logs.
-          envs: OPCACHE_RESET_URL,DEPLOY_TOKEN
+          envs: OPCACHE_RESET_URL,DEPLOY_TOKEN,HAS_IMAGES,EXPECTED_BASE
           timeout: 30s
           command_timeout: 5m
           script: |
             set -e
             CONTAINER="${{ inputs.app-container }}"
             VOLUME="${{ inputs.public-volume-path }}"
+            BASIS_FILE="${{ inputs.deploy-path }}/.quick-deploy-basis"
+
+            # Sperre je Pfad (flock auf <pfad>/.deploy.lock, util-linux): der gesamte schreibende
+            # Teil läuft nie parallel zu einem anderen Quick- oder Full-Deploy desselben Pfads,
+            # auch dann nicht, wenn GitHub einen Lauf abbricht und dessen ssh-Prozess am Ziel
+            # weiterläuft (er hält die Sperre bis zu seinem Ende). Die Sperre hält ein eigener
+            # Hilfsprozess, der endet, sobald dieses Skript endet. So erbt kein Kindprozess des
+            # Skripts (auch nicht aus pre-/post-deploy-commands) die Sperre. Ein zweiter Lauf
+            # wartet mit Frist und scheitert danach laut.
+            acquire_deploy_lock() { # pfad frist-in-sekunden
+              local lp="$1" wait_s="$2" ok_dir ok holder ticks=0 max_ticks
+              # Rückmeldung des Hilfsprozesses in einem privaten Verzeichnis (0700), das
+              # bestehen bleibt, bis die Sperre erhalten ist: kein vorgetäuschtes "gesperrt".
+              ok_dir=$(mktemp -d) || { echo "::error::mktemp fehlgeschlagen, Deploy-Sperre nicht möglich. Nichts ausgerollt."; return 1; }
+              ok="$ok_dir/gesperrt"
+              flock -w "$wait_s" "$lp/.deploy.lock" sh -c 'echo gesperrt > "$1" || exit 1; while kill -0 "$2" 2>/dev/null; do sleep 1; done' sh "$ok" "$$" >/dev/null 2>&1 &
+              holder=$!
+              # Wartezeit begrenzt: Sperrfrist plus 30 Sekunden Reserve (5 Prüfungen je Sekunde)
+              max_ticks=$(( (wait_s + 30) * 5 ))
+              while [ ! -s "$ok" ]; do
+                if ! kill -0 "$holder" 2>/dev/null && [ ! -s "$ok" ]; then
+                  rmdir "$ok_dir" 2>/dev/null
+                  echo "::error::Deploy-Sperre $lp/.deploy.lock nach $wait_s Sekunden nicht erhalten (anderer Deploy läuft noch). Nichts ausgerollt."
+                  return 1
+                fi
+                ticks=$((ticks + 1))
+                if [ "$ticks" -ge "$max_ticks" ]; then
+                  kill "$holder" 2>/dev/null
+                  rm -f "$ok"; rmdir "$ok_dir" 2>/dev/null
+                  echo "::error::Deploy-Sperre $lp/.deploy.lock: keine Rückmeldung des Sperr-Hilfsprozesses innerhalb der Frist. Nichts ausgerollt."
+                  return 1
+                fi
+                sleep 0.2
+              done
+              rm -f "$ok"; rmdir "$ok_dir"
+            }
+            if ! acquire_deploy_lock "${{ inputs.deploy-path }}" 120; then
+              exit 1
+            fi
+
+            # Basis-Vermerk beanspruchen UND ungültig machen, BEVOR das Ziel verändert wird:
+            # bricht dieser Lauf ab (cancel, Fehler), gilt kein veralteter Vermerk weiter,
+            # und der nächste Deploy fällt auf Full-Deploy zurück. Das Umbenennen ist atomar:
+            # hat ein anderer Deploy den Vermerk inzwischen gelöscht oder ersetzt (Stand am
+            # Ziel nicht mehr der, auf dem detect-changes entschieden hat), bricht dieser
+            # Quick-Deploy ab, ohne etwas zu verändern.
+            rm -f "$BASIS_FILE".tmp.* "$BASIS_FILE.claimed"
+            if ! mv "$BASIS_FILE" "$BASIS_FILE.claimed"; then
+              echo "::error::Basis-Vermerk nicht mehr vorhanden, Stand am Ziel hat sich geändert. Nichts ausgerollt, nächster Deploy ist ein Full-Deploy."
+              exit 1
+            fi
+            CLAIMED_BASE=$(head -n 1 "$BASIS_FILE.claimed" | tr -d '[:space:]')
+            rm -f "$BASIS_FILE.claimed"
+            if [ -z "$EXPECTED_BASE" ] || [ "$CLAIMED_BASE" != "$EXPECTED_BASE" ]; then
+              echo "::error::Basis am Ziel ($CLAIMED_BASE) weicht von der Entscheidungsgrundlage ($EXPECTED_BASE) ab. Nichts ausgerollt, nächster Deploy ist ein Full-Deploy."
+              exit 1
+            fi
 
             docker cp /tmp/quick-deploy/resources/views/. "$CONTAINER":/var/www/resources/views/
             if [ -d /tmp/quick-deploy/lang ]; then
@@ -269,7 +392,7 @@ jobs:
               # public/images/ — additive copy into the public volume so new
               # static images (e.g. /images/about/foo.jpg) reach nginx without
               # a full Docker rebuild. www-data inside the container is uid 82.
-              if [ -d /tmp/quick-deploy/public/images ]; then
+              if [ "$HAS_IMAGES" = "true" ] && [ -d /tmp/quick-deploy/public/images ]; then
                 mkdir -p "$VOLUME/images"
                 cp -r /tmp/quick-deploy/public/images/. "$VOLUME/images/"
                 chown -R 82:82 "$VOLUME/images"
@@ -295,6 +418,7 @@ jobs:
             # opcache_reset() im FPM-Worker-Kontext aufruft (CLI-opcache_reset wirkt
             # nicht auf FPM). kill -USR2 bleibt als Fallback, wenn keine URL gesetzt.
             RESET_OK=0
+            RESET_FAILED=0
             if [ -n "$OPCACHE_RESET_URL" ] && [ -n "$DEPLOY_TOKEN" ]; then
               # Token per Header (nicht als Query-String → landet nicht in
               # nginx-/Proxy-Access-Logs). -H via env, nicht ins URL interpoliert.
@@ -311,12 +435,33 @@ jobs:
             fi
             if [ "$RESET_OK" = "0" ]; then
               echo "Fallback: kill -USR2 an FPM-Master"
-              docker exec --user root "$CONTAINER" kill -USR2 1 \
-                || echo "WARN: USR2 failed; consider docker compose restart"
+              if ! docker exec --user root "$CONTAINER" kill -USR2 1; then
+                RESET_FAILED=1
+                echo "WARN: USR2 failed; consider docker compose restart"
+              fi
             fi
 
             rm -rf /tmp/quick-deploy
-            echo "Quick deploy done"
+
+            # Basis-Vermerk erst jetzt, nach vollständig erfolgreichem Ausrollen (set -e):
+            # der nächste Quick-Deploy diffte gegen diesen Stand. Ohne geglückten
+            # OPcache-Reset gilt der Stand nicht als ausgerollt (kein Vermerk, nächster
+            # Deploy ist ein Full-Deploy). Atomar über eine laufbezogene .tmp-Datei.
+            if [ "$RESET_FAILED" = "1" ]; then
+              echo "WARN: Basis-Vermerk nicht geschrieben (OPcache-Reset fehlgeschlagen), nächster Deploy ist ein Full-Deploy"
+            else
+              BASIS_TMP="$BASIS_FILE.tmp.$$"
+              printf '%s\n' "${{ github.sha }}" > "$BASIS_TMP"
+              # ln schlägt fehl, wenn inzwischen ein anderer Deploy einen Vermerk geschrieben
+              # hat (dessen Stand gilt dann, ein Quick-Deploy überschreibt nie einen Full-Deploy).
+              if ln "$BASIS_TMP" "$BASIS_FILE"; then
+                rm -f "$BASIS_TMP"
+              else
+                rm -f "$BASIS_TMP"
+                echo "WARN: Basis-Vermerk von einem anderen Deploy gesetzt, bleibt bestehen"
+              fi
+            fi
+            echo "Quick deploy done (Basis ${{ github.sha }})"
 
   # ── Full Deploy: Docker build + push + restart ───────────────────────────────
   full-deploy:
@@ -475,6 +620,11 @@ jobs:
           tags: |
             ghcr.io/${{ inputs.image-name }}:latest
             ghcr.io/${{ inputs.image-name }}:${{ github.sha }}
+          # Revision im Image: der Basis-Vermerk nach dem Deploy wird aus diesem Label des
+          # tatsächlich gestarteten Containers gelesen, nicht aus github.sha (sonst könnte
+          # ein :latest eines anderen, abgebrochenen Laufs unter fremdem SHA verbucht werden).
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
           # No cache-from/to: the persistent docker-container builder above keeps
           # its full layer cache + RUN --mount=type=cache caches in its local
           # state volume between jobs. That is strictly faster than the previous
@@ -545,7 +695,67 @@ jobs:
               fi
             }
 
+            # Sperre je Pfad (flock auf <pfad>/.deploy.lock, util-linux): der gesamte schreibende
+            # Teil läuft nie parallel zu einem anderen Quick- oder Full-Deploy desselben Pfads,
+            # auch dann nicht, wenn GitHub einen Lauf abbricht und dessen ssh-Prozess am Ziel
+            # weiterläuft (er hält die Sperre bis zu seinem Ende). Die Sperre hält ein eigener
+            # Hilfsprozess, der endet, sobald dieses Skript endet. So erbt kein Kindprozess des
+            # Skripts (auch nicht aus pre-/post-deploy-commands) die Sperre. Ein zweiter Lauf
+            # wartet mit Frist und scheitert danach laut.
+            acquire_deploy_lock() { # pfad frist-in-sekunden
+              local lp="$1" wait_s="$2" ok_dir ok holder ticks=0 max_ticks
+              # Rückmeldung des Hilfsprozesses in einem privaten Verzeichnis (0700), das
+              # bestehen bleibt, bis die Sperre erhalten ist: kein vorgetäuschtes "gesperrt".
+              ok_dir=$(mktemp -d) || { echo "::error::mktemp fehlgeschlagen, Deploy-Sperre nicht möglich. Nichts ausgerollt."; return 1; }
+              ok="$ok_dir/gesperrt"
+              flock -w "$wait_s" "$lp/.deploy.lock" sh -c 'echo gesperrt > "$1" || exit 1; while kill -0 "$2" 2>/dev/null; do sleep 1; done' sh "$ok" "$$" >/dev/null 2>&1 &
+              holder=$!
+              # Wartezeit begrenzt: Sperrfrist plus 30 Sekunden Reserve (5 Prüfungen je Sekunde)
+              max_ticks=$(( (wait_s + 30) * 5 ))
+              while [ ! -s "$ok" ]; do
+                if ! kill -0 "$holder" 2>/dev/null && [ ! -s "$ok" ]; then
+                  rmdir "$ok_dir" 2>/dev/null
+                  echo "::error::Deploy-Sperre $lp/.deploy.lock nach $wait_s Sekunden nicht erhalten (anderer Deploy läuft noch). Nichts ausgerollt."
+                  return 1
+                fi
+                ticks=$((ticks + 1))
+                if [ "$ticks" -ge "$max_ticks" ]; then
+                  kill "$holder" 2>/dev/null
+                  rm -f "$ok"; rmdir "$ok_dir" 2>/dev/null
+                  echo "::error::Deploy-Sperre $lp/.deploy.lock: keine Rückmeldung des Sperr-Hilfsprozesses innerhalb der Frist. Nichts ausgerollt."
+                  return 1
+                fi
+                sleep 0.2
+              done
+              rm -f "$ok"; rmdir "$ok_dir"
+            }
+
             cd "${{ inputs.deploy-path }}"
+
+            # Basis-Vermerk ungültig machen, BEVOR das Ziel verändert wird (nur bei Repos
+            # mit Quick-Deploy). Er wird erst nach vollständigem Erfolg neu geschrieben;
+            # bricht der Deploy dazwischen ab, fällt der nächste Lauf auf Full-Deploy zurück.
+            if [ -n "${{ inputs.app-container }}" ]; then
+              # Sperre für den Hauptpfad UND alle Extra-Pfade, damit auch dort kein Quick- oder
+              # Full-Deploy parallel läuft. Die Pfade werden sortiert gesperrt (einheitliche
+              # Reihenfolge, kein Verklemmen zweier Läufe mit vertauschten Haupt- und Extra-Pfaden).
+              LOCK_PATHS=$(printf '%s\n%s\n' "${{ inputs.deploy-path }}" "${{ inputs.extra-deploy-paths }}" | xargs -n1 | LC_ALL=C sort -u)
+              for lock_path in $LOCK_PATHS; do
+                if ! acquire_deploy_lock "$lock_path" 300; then
+                  exit 1
+                fi
+              done
+              rm -f "${{ inputs.deploy-path }}/.quick-deploy-basis" "${{ inputs.deploy-path }}/.quick-deploy-basis".tmp.*
+            fi
+            # Extra-Pfade bekommen ebenfalls neuen Code: ein eigener Vermerk dort (der Pfad
+            # kann auch Hauptpfad eines anderen Deploys sein) darf nicht gültig bleiben.
+            printf '%s\n' "${{ inputs.extra-deploy-paths }}" | while IFS= read -r extra; do
+              extra=$(echo "$extra" | xargs)
+              if [ -n "$extra" ]; then
+                rm -f "$extra/.quick-deploy-basis" "$extra"/.quick-deploy-basis.tmp.*
+              fi
+            done
+
             docker compose pull
 
             # Pre-deploy commands (e.g. migrations before up)
@@ -568,6 +778,26 @@ jobs:
                   compose_up
                 fi
               done
+            fi
+
+            # Basis-Vermerk erst nach erfolgreichem Ausrollen (set -euo pipefail, alle
+            # Pfade): der nächste Quick-Deploy diffte gegen diesen Stand und fällt auf
+            # Full-Deploy zurück, wenn er fehlt. Der Wert ist die Revision aus dem Label
+            # des laufenden App-Containers (an das tatsächlich gestartete Image gebunden),
+            # nicht github.sha; fehlt oder ungültig, bleibt der Vermerk weg (fail closed).
+            # Atomar über eine laufbezogene .tmp-Datei. Nur bei Repos mit Quick-Deploy.
+            if [ -n "${{ inputs.app-container }}" ]; then
+              if ! REVISION=$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "${{ inputs.app-container }}"); then
+                REVISION=""
+              fi
+              if printf '%s' "$REVISION" | grep -qE '^[0-9a-f]{40}$'; then
+                BASIS_TMP="${{ inputs.deploy-path }}/.quick-deploy-basis.tmp.$$"
+                printf '%s\n' "$REVISION" > "$BASIS_TMP"
+                mv "$BASIS_TMP" "${{ inputs.deploy-path }}/.quick-deploy-basis"
+                echo "Basis-Vermerk: $REVISION"
+              else
+                echo "::warning::Image-Revision des Containers ${{ inputs.app-container }} nicht lesbar, kein Basis-Vermerk (nächster Deploy ist ein Full-Deploy)"
+              fi
             fi
 
             # Cleanup old images (skip recently used to avoid race with concurrent deploys)

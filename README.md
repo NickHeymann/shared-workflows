@@ -110,6 +110,59 @@ ergänzen (die Eingabe ersetzt den Standard, also die Standardliste mitgeben).
 Verfügbar ab der Version, die diese Änderung trägt (siehe Tag-Liste im PR); ältere Tags
 behalten das alte Verhalten.
 
+## Quick-Deploy: Basis-Vermerk und Guards
+
+Der Quick-Deploy (Views, Sprachdateien, CSS/JS, Bilder ohne Image-Build) ist nur aktiv,
+wenn das Repo `app-container` setzt.
+
+**Basis statt Vorgänger-Commit.** Früher verglich `detect-changes` nur `HEAD~1` mit `HEAD`.
+Brach `concurrency: cancel-in-progress` (oder ein Handabbruch, ein Fehlschlag) den Lauf
+für Commit A ab und der Folge-Commit B enthielt nur Views oder `nginx.conf`, übertrug der
+Quick-Deploy von B nur B's Diff: die PHP-Änderungen von A kamen nie an, obwohl `main` grün
+meldete (nickheymann-tall, 76681c7 und e0988ad, 21.11.2026).
+
+Jetzt gilt ein Basis-Vermerk am Ziel (`<deploy-path>/.quick-deploy-basis`, nur bei gesetztem
+`app-container`):
+
+- Er wird **vor der ersten Änderung am Ziel gelöscht** (Full-Deploy vor `docker compose pull`,
+  Quick-Deploy vor dem ersten `docker cp`). Bricht ein Lauf ab oder scheitert, bleibt kein
+  veralteter Vermerk gültig.
+- Er wird **erst nach vollständigem Erfolg neu geschrieben** (atomar über `.tmp` + `mv`):
+  Full-Deploy nach compose up, post-deploy-commands und Extra-Pfaden, mit der Revision aus dem
+  Label `org.opencontainers.image.revision` des laufenden App-Containers (der Build setzt es auf
+  `github.sha`), also gebunden an das wirklich gestartete Image und nicht an einen Lauf, dessen
+  `:latest` überschrieben wurde. Quick-Deploy nach Kopieren und gelungenem OPcache-Reset
+  (scheitert der Reset, bleibt der Vermerk weg).
+- Der Quick-Deploy beansprucht den Vermerk per atomarem Umbenennen und vergleicht ihn mit der
+  Basis, auf der `detect-changes` entschieden hat. Hat ein anderer Deploy den Stand am Ziel
+  inzwischen geändert (Vermerk weg oder anders), bricht er rot ab, ohne etwas auszurollen. Er
+  überschreibt nie einen Vermerk, den ein anderer Deploy inzwischen gesetzt hat. Der Full-Deploy
+  löscht zusätzlich die Vermerke seiner Extra-Pfade.
+- Der gesamte schreibende Teil von Quick- und Full-Deploy läuft unter einer Sperre je Pfad
+  (`flock` auf `<pfad>/.deploy.lock`, util-linux ist am Server vorhanden). Der Full-Deploy sperrt
+  Hauptpfad und Extra-Pfade, sortiert (kein Verklemmen bei vertauschten Pfaden). Die Sperre hält
+  ein eigener Hilfsprozess, der endet, sobald das Deploy-Skript endet: Hintergrundprozesse aus
+  `pre-/post-deploy-commands` erben sie nicht. Ein zweiter Lauf wartet mit Frist (Quick 120 s,
+  Full 300 s je Pfad) und scheitert danach laut, er läuft nie parallel. Ein nach einem
+  GitHub-Abbruch weiterlaufendes Deploy-Skript hält die Sperre bis zu seinem Ende.
+  Temporäre Vermerk-Dateien sind laufbezogen (`.tmp.<PID>`).
+- `detect-changes` liest den Vermerk per ssh und diffet `Basis..HEAD`. Der Full-Deploy läuft (fail
+  closed), wenn der Vermerk fehlt, kein 40-stelliger SHA ist, nicht lesbar ist oder der
+  Basis-Commit nicht abrufbar ist. Folge: der erste Deploy nach der Umstellung auf eine Version
+  mit Basis-Vermerk ist immer ein Full-Deploy (Vermerk fehlt noch), ebenso der Deploy nach jedem
+  abgebrochenen oder fehlgeschlagenen Lauf.
+
+Eine Wiederholung eines alten Laufs setzt den Vermerk auf dessen Commit zurück (der Stand am
+Ziel ist dann tatsächlich der alte); der nächste Push holt die Differenz nach.
+
+**`public/images/` ist optional.** Wie `lang/` wird das Verzeichnis nur hochgeladen und
+kopiert, wenn es im Repo existiert (master-admin hat keins im Git; ohne Guard brach der
+rsync-Schritt ab).
+
+Test (Trockenlauf des Shell-Teils gegen ein Attrappen-Repo, loest keinen Deploy aus):
+`tests/test-quick-deploy.sh` (Voraussetzung: bash, git, ruby). Mit einer älteren Fassung der
+Workflow-Datei als Argument muss er rot werden.
+
 ## Tooling (on the Mac, ~/.claude/scripts/ci/)
 
 | Script | Purpose |
