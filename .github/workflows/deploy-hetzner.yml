@@ -707,6 +707,34 @@ jobs:
               echo "::error::stateful-services enthaelt ungueltige Zeichen"
               exit 1
             fi
+            # docker compose pull mit begrenzter Wiederholung NUR bei dem bekannten Fehler des
+            # containerd-Image-Speichers (NotFound: content digest / lease does not exist): ein
+            # gleichzeitiger `docker image prune` auf dem gemeinsamen Server löscht die Lease
+            # eines laufenden Pulls (moby/moby#53321), der Pull bricht mit einem fehlenden
+            # Inhalt ab, obwohl das Image vollständig in der Registry liegt. Jeder andere Fehler
+            # (Anmeldung, Netz, Image fehlt wirklich) schlägt sofort fehl, ohne Wiederholung.
+            compose_pull() {
+              local attempt=1 max=3 out rc
+              while :; do
+                if out=$(docker compose pull 2>&1); then
+                  printf '%s\n' "$out"
+                  return 0
+                else
+                  rc=$?
+                fi
+                printf '%s\n' "$out"
+                if ! printf '%s' "$out" | grep -qE 'NotFound: content digest|lease does not exist'; then
+                  return "$rc"
+                fi
+                if [ "$attempt" -ge "$max" ]; then
+                  echo "::error::docker compose pull scheiterte $max Mal an fehlendem Inhalt im Image-Speicher (NotFound: content digest). Nichts ausgerollt."
+                  return "$rc"
+                fi
+                echo "::warning::docker compose pull: Inhalt im Image-Speicher fehlt (NotFound: content digest, vermutlich gleichzeitiger docker image prune). Versuch $attempt von $max, neuer Versuch in ${PULL_RETRY_WAIT:-15} Sekunden."
+                attempt=$((attempt + 1))
+                sleep "${PULL_RETRY_WAIT:-15}"
+              done
+            }
             compose_up() {
               local svc s keep="" app="" all
               # Zuweisung getrennt, damit ein Fehler von compose config (set -e) den Deploy
@@ -810,7 +838,7 @@ jobs:
               fi
             done
 
-            docker compose pull
+            compose_pull
 
             # Pre-deploy commands (e.g. migrations before up)
             ${{ inputs.pre-deploy-commands }}
@@ -828,7 +856,7 @@ jobs:
                 if [ -n "$path" ]; then
                   echo "Deploying to extra path: $path"
                   cd "$path"
-                  docker compose pull
+                  compose_pull
                   compose_up
                 fi
               done
