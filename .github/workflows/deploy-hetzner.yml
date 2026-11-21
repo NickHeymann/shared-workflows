@@ -190,8 +190,9 @@ jobs:
 
           # Quick-Liste (fail closed): Quick ist ein Deploy nur, wenn JEDE geänderte Datei auf einer
           # der Regeln unten steht. Die Regeln spiegeln, was der Job quick-deploy wirklich ausrollt
-          # (rsync und docker cp von resources/views und lang, Vite-Build nach public/build, additive
-          # Kopie von public/images, Kopie von build und images nur mit public-volume-path). Jede
+          # (additive Kopie von resources/views und lang, Vite-Build nach public/build, additive
+          # Kopie von public/images, Kopie von build und images nur mit public-volume-path; nur
+          # Neuanlagen und Änderungen, keine Löschungen oder Umbenennungen). Jede
           # andere Datei (Dockerfile, docker/, scripts/, Compose-Dateien, resources/ außer views, css
           # und js, public/ außer build und images, Wurzeldateien, nginx.conf ...) wird vom
           # Quick-Deploy nicht ausgerollt und führt zum Full-Deploy.
@@ -204,25 +205,25 @@ jobs:
           }
           classify_file() { # status datei
             local st="$1" f="$2"
+            # Der Quick-Deploy kopiert nur additiv (docker cp, cp -r legen Dateien an oder
+            # überschreiben sie, entfernen aber nichts am Ziel; --delete wirkt nur im Staging).
+            # Gelöschte oder umbenannte Dateien (alter Pfad) kämen nie an: immer Full.
+            case "$st" in
+              A*|M*|T*) ;;
+              *) full_because "$f" "Status $st: der Quick-Deploy kopiert nur additiv und rollt Löschungen und Umbenennungen nicht aus"; return 0 ;;
+            esac
             case "$f" in
               resources/views/*)
                 return 0 ;;
               lang/*)
                 # Upload-Schritt läuft nur, wenn lang/ im neuen Stand existiert
                 if [ -d lang ]; then return 0; fi
-                full_because "$f" "lang/ existiert im neuen Stand nicht mehr, der Quick-Deploy rollt die Löschung nicht aus" ;;
-              resources/css/*|resources/js/*|public/build/*)
-                # Eingaben bzw. Ergebnis des Vite-Builds; am Ziel kommt nur public/build an, und nur mit public-volume-path
+                full_because "$f" "lang/ existiert im neuen Stand nicht, der Upload-Schritt entfällt" ;;
+              resources/css/*|resources/js/*|public/build/*|public/images/*)
+                # Eingaben bzw. Ergebnis des Vite-Builds und Bilder; am Ziel kommen public/build und
+                # public/images an, und nur mit public-volume-path
                 if [ -n "$PUBLIC_VOLUME" ]; then return 0; fi
-                full_because "$f" "kein public-volume-path: der Quick-Deploy kopiert public/build nicht ans Ziel" ;;
-              public/images/*)
-                if [ -z "$PUBLIC_VOLUME" ]; then
-                  full_because "$f" "kein public-volume-path: der Quick-Deploy kopiert public/images nicht ans Ziel"
-                elif [ "$st" = "D" ]; then
-                  full_because "$f" "gelöscht, der Quick-Deploy kopiert public/images nur additiv und rollt Löschungen nicht aus"
-                else
-                  return 0
-                fi ;;
+                full_because "$f" "kein public-volume-path: der Quick-Deploy kopiert public/build und public/images nicht ans Ziel" ;;
               *)
                 full_because "$f" "nicht auf der Quick-Liste, der Quick-Deploy rollt diese Datei nicht aus" ;;
             esac
