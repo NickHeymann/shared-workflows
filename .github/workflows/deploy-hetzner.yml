@@ -64,6 +64,21 @@ on:
         required: false
         type: string
         default: '22'
+      server-config-files:
+        description: 'Konfigurationsdateien aus dem Repo, die der Deploy in den deploy-path am Server legt (relative Pfade, Leerzeichen, Komma oder Zeilenumbruch getrennt, z. B. docker-compose.yml und nginx.conf). Vor docker compose up: Sicherung mit Zeitstempel, atomarer Austausch, bei Fehler vor compose up Rückrollen. Nach compose up: Hash-Vergleich am Server gegen den Commit, Abweichung macht den Lauf rot. Eine Änderung oder Abweichung einer gelisteten Datei erzwingt den Full-Deploy. Nur Dateien auflisten, die am Server NICHT von Hand gepflegt werden (die .env gehört nie dazu). Gilt nur für deploy-path, nicht für extra-deploy-paths. Leer (Standard) = altes Verhalten.'
+        required: false
+        type: string
+        default: ''
+      nginx-config-container:
+        description: 'Name des nginx-Containers, der die in nginx-config-file genannte Datei als /etc/nginx/nginx.conf eingehängt hat. Gesetzt: die Datei wird vor dem Einspielen mit nginx -t im laufenden Container geprüft (bei Fehler nichts verändert), und nach compose up muss der Container dieselbe Datei geladen haben (sha256 und nginx -t). Wirkt nur zusammen mit nginx-config-file und server-config-files. Hinweis: eine einzeln eingehängte Datei erreicht den Container erst, wenn compose ihn neu erzeugt (nginx darf nicht in stateful-services stehen).'
+        required: false
+        type: string
+        default: ''
+      nginx-config-file:
+        description: 'Relativer Pfad der nginx-Konfiguration in server-config-files (z. B. nginx.conf). Nur zusammen mit nginx-config-container.'
+        required: false
+        type: string
+        default: ''
 
 env:
   REGISTRY: ghcr.io
@@ -76,6 +91,8 @@ jobs:
       quick: ${{ steps.check.outputs.quick }}
       base: ${{ steps.check.outputs.base }}
       stage: ${{ steps.stage.outputs.dir }}
+      config-files: ${{ steps.cfg.outputs.files }}
+      config-hashes: ${{ steps.cfg.outputs.hashes }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -86,6 +103,77 @@ jobs:
       - name: Staging name
         id: stage
         run: echo "dir=quick-deploy-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')" >> "$GITHUB_OUTPUT"
+
+      # Server-Konfigurationsdateien (server-config-files): Liste prüfen und den sha256 jeder
+      # Datei im Checkout bilden. Leere Eingabe = nichts zu tun (altes Verhalten). Eine ungültige
+      # Liste macht den Lauf rot, bevor irgendetwas am Ziel passiert.
+      - name: Server config files (Liste prüfen, Hashes)
+        id: cfg
+        env:
+          CONFIG_FILES_RAW: ${{ inputs.server-config-files }}
+          NGINX_CONFIG_CONTAINER: ${{ inputs.nginx-config-container }}
+          NGINX_CONFIG_FILE: ${{ inputs.nginx-config-file }}
+        run: |
+          set -euo pipefail
+          set -f
+          files=""
+          hashes=""
+          for p in $(printf '%s' "$CONFIG_FILES_RAW" | tr ',\r\n\t' '    '); do
+            if ! printf '%s' "$p" | grep -qE '^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$' || printf '%s' "$p" | grep -qF '..'; then
+              echo "::error::server-config-files: ungültiger Pfad '$p' (erlaubt: relative Pfade aus A-Z a-z 0-9 . _ - und /, kein .. und kein führender /)"
+              exit 1
+            fi
+            case " $files " in *" $p "*) continue ;; esac
+            if [ ! -f "$p" ] || [ -L "$p" ]; then
+              echo "::error::server-config-files: '$p' ist im Repo keine normale Datei"
+              exit 1
+            fi
+            files="${files:+$files }$p"
+            hashes="${hashes:+$hashes,}$p=$(sha256sum "$p" | cut -d' ' -f1)"
+          done
+          if [ -n "$NGINX_CONFIG_CONTAINER$NGINX_CONFIG_FILE" ]; then
+            if [ -z "$NGINX_CONFIG_CONTAINER" ] || [ -z "$NGINX_CONFIG_FILE" ]; then
+              echo "::error::nginx-config-container und nginx-config-file gelten nur zusammen"
+              exit 1
+            fi
+            if ! printf '%s' "$NGINX_CONFIG_CONTAINER" | grep -qE '^[A-Za-z0-9][A-Za-z0-9_.-]*$'; then
+              echo "::error::nginx-config-container: ungültiger Containername"
+              exit 1
+            fi
+            case " $files " in
+              *" $NGINX_CONFIG_FILE "*) ;;
+              *) echo "::error::nginx-config-file '$NGINX_CONFIG_FILE' steht nicht in server-config-files"; exit 1 ;;
+            esac
+          fi
+          echo "files=$files" >> "$GITHUB_OUTPUT"
+          echo "hashes=$hashes" >> "$GITHUB_OUTPUT"
+          if [ -n "$files" ]; then
+            echo "Server-Konfigurationsdateien: $files"
+          fi
+
+      # Stand der gelisteten Dateien am Ziel (nur lesend). continue-on-error: ein nicht lesbarer
+      # Stand führt zum Full-Deploy (fail closed), nicht zu einem roten Lauf.
+      - name: Read server config hashes
+        id: serverconfig
+        if: steps.cfg.outputs.files != ''
+        continue-on-error: true
+        uses: appleboy/ssh-action@v1.2.5
+        with:
+          host: 46.224.6.69
+          username: root
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          timeout: 30s
+          command_timeout: 1m
+          capture_stdout: true
+          script: |
+            cd "${{ inputs.deploy-path }}" || exit 1
+            OUT=""
+            for p in ${{ steps.cfg.outputs.files }}; do
+              if [ -f "$p" ]; then
+                OUT="${OUT:+$OUT,}$p=$(sha256sum "$p" | cut -d' ' -f1)"
+              fi
+            done
+            echo "SERVER_CONFIG_HASHES=$OUT"
 
       # Basis des Quick-Deploys: der zuletzt VOLLSTÄNDIG ausgerollte Commit, vom Ziel
       # selbst gemeldet (Datei <deploy-path>/.quick-deploy-basis, geschrieben erst nach
@@ -118,6 +206,9 @@ jobs:
           APP_CONTAINER: ${{ inputs.app-container }}
           PUBLIC_VOLUME: ${{ inputs.public-volume-path }}
           BASIS_RAW: ${{ steps.basis.outputs.stdout }}
+          CONFIG_FILES: ${{ steps.cfg.outputs.files }}
+          CONFIG_HASHES: ${{ steps.cfg.outputs.hashes }}
+          SERVER_CONFIG_RAW: ${{ steps.serverconfig.outputs.stdout }}
         run: |
           # Quick deploy only possible if app-container is configured
           if [ -z "$APP_CONTAINER" ]; then
@@ -179,10 +270,22 @@ jobs:
           echo "Changed files since basis:"
           echo "$CHANGED"
 
-          # nginx.conf liegt am Server und wird dort von Hand gepflegt: weder Quick- noch
-          # Full-Deploy rollen sie aus. Der Lauf meldet das ehrlich, statt sie still als
-          # "quick ausgerollt" zu führen.
-          if echo "$CHANGED" | grep -qE '(^|/)nginx\.conf$'; then
+          in_config_list() { # pfad: steht in server-config-files (wird vom Deploy ausgeliefert)
+            case " $CONFIG_FILES " in *" $1 "*) return 0 ;; esac
+            return 1
+          }
+
+          # nginx.conf liegt am Server und wird dort von Hand gepflegt, solange sie nicht in
+          # server-config-files steht: weder Quick- noch Full-Deploy rollen sie dann aus. Der
+          # Lauf meldet das ehrlich, statt sie still als "quick ausgerollt" zu führen.
+          NGINX_UNMANAGED=false
+          while IFS= read -r changed_file; do
+            case "$changed_file" in
+              nginx.conf|*/nginx.conf)
+                if ! in_config_list "$changed_file"; then NGINX_UNMANAGED=true; fi ;;
+            esac
+          done <<< "$CHANGED"
+          if [ "$NGINX_UNMANAGED" = "true" ]; then
             MSG="nginx.conf hat sich geändert, wird aber NICHT ausgerollt (am Server von Hand gepflegt). Änderung dort selbst einspielen."
             echo "::warning::$MSG"
             [ -n "${GITHUB_STEP_SUMMARY:-}" ] && echo "**Hinweis:** $MSG" >> "$GITHUB_STEP_SUMMARY"
@@ -212,6 +315,11 @@ jobs:
               A*|M*|T*) ;;
               *) full_because "$f" "Status $st: der Quick-Deploy kopiert nur additiv und rollt Löschungen und Umbenennungen nicht aus"; return 0 ;;
             esac
+            # Gelistete Serverdateien rollt nur der Full-Deploy aus: nie Quick ohne Auslieferung.
+            if in_config_list "$f"; then
+              full_because "$f" "server-config-files: nur der Full-Deploy legt die Datei am Ziel ab"
+              return 0
+            fi
             case "$f" in
               resources/views/*)
                 return 0 ;;
@@ -229,6 +337,29 @@ jobs:
             esac
             return 0
           }
+
+          # Stand der gelisteten Serverdateien: fehlt eine, ist sie nicht lesbar oder weicht ihr Hash
+          # vom Checkout ab, bekommt der Server sie im Full-Deploy (auch ohne Änderung im Diff, z. B.
+          # nach einem früheren Deploy, der sie nicht ausgeliefert hat). Fehlender oder nicht
+          # lesbarer Serverstand zählt als Abweichung (fail closed).
+          if [ -n "$CONFIG_FILES" ]; then
+            SERVER_LINE=$(printf '%s\n' "$SERVER_CONFIG_RAW" | sed -n 's/^SERVER_CONFIG_HASHES=//p' | tail -n 1 | tr -d '[:space:]')
+            IFS=',' read -r -a CFG_ENTRIES <<< "$CONFIG_HASHES"
+            IFS=',' read -r -a SRV_ENTRIES <<< "$SERVER_LINE"
+            for cfg_entry in "${CFG_ENTRIES[@]}"; do
+              cfg_path="${cfg_entry%%=*}"
+              cfg_hash="${cfg_entry#*=}"
+              srv_hash=""
+              for srv_entry in ${SRV_ENTRIES[@]+"${SRV_ENTRIES[@]}"}; do
+                if [ "${srv_entry%%=*}" = "$cfg_path" ]; then srv_hash="${srv_entry#*=}"; fi
+              done
+              if [ -z "$srv_hash" ]; then
+                full_because "$cfg_path" "server-config-files: Datei fehlt am Ziel oder der Serverstand ist nicht lesbar"
+              elif [ "$srv_hash" != "$cfg_hash" ]; then
+                full_because "$cfg_path" "server-config-files: Datei am Ziel weicht vom Repo-Stand ab (sha256)"
+              fi
+            done
+          fi
 
           while IFS=$'\t' read -r st file; do
             [ -z "$file" ] && continue
@@ -449,6 +580,27 @@ jobs:
               exit 1
             fi
 
+            # Wächter für server-config-files: der Quick-Deploy legt keine Konfigurationsdateien ab
+            # (detect-changes wählt bei Änderung oder Abweichung den Full-Deploy). Stimmt eine
+            # gelistete Datei am Ziel jetzt trotzdem nicht mit dem Commit überein, bricht dieser
+            # Lauf VOR jeder Änderung ab (rot), statt einen Stand ohne sie als ausgerollt zu führen.
+            SERVER_CONFIG_HASHES="${{ needs.detect-changes.outputs.config-hashes }}"
+            if [ -n "$SERVER_CONFIG_HASHES" ]; then
+              IFS=',' read -r -a CONFIG_ENTRIES <<< "$SERVER_CONFIG_HASHES"
+              for cfg_entry in "${CONFIG_ENTRIES[@]}"; do
+                cfg_path="${cfg_entry%%=*}"
+                cfg_hash="${cfg_entry#*=}"
+                if ! cfg_out=$(sha256sum "${{ inputs.deploy-path }}/$cfg_path"); then
+                  echo "::error::server-config-files: $cfg_path am Ziel nicht lesbar. Nichts ausgerollt."
+                  exit 1
+                fi
+                if [ "${cfg_out%% *}" != "$cfg_hash" ]; then
+                  echo "::error::server-config-files: $cfg_path am Ziel weicht vom Commit ab. Nichts ausgerollt. Neuen Lauf starten (Re-run all jobs): detect-changes wählt dann den Full-Deploy, der die Datei einspielt."
+                  exit 1
+                fi
+              done
+            fi
+
             # Basis-Vermerk beanspruchen UND ungültig machen, BEVOR das Ziel verändert wird:
             # bricht dieser Lauf ab (cancel, Fehler), gilt kein veralteter Vermerk weiter,
             # und der nächste Deploy fällt auf Full-Deploy zurück. Das Umbenennen ist atomar:
@@ -565,9 +717,66 @@ jobs:
     needs: detect-changes
     if: needs.detect-changes.outputs.quick == 'false'
     runs-on: ${{ inputs.runner }}
+    env:
+      # Staging-Verzeichnis der Server-Konfigurationsdateien am Ziel (je Lauf und Versuch)
+      CFG_STAGE: /tmp/${{ needs.detect-changes.outputs.stage }}-cfg-a${{ github.run_attempt }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      # server-config-files: gelistete Dateien aus dem Checkout bündeln. Der Hash jeder Datei wird
+      # gegen den Wert aus detect-changes geprüft (derselbe Commit), sonst Abbruch vor dem Upload.
+      - name: Stage server config files
+        if: needs.detect-changes.outputs.config-files != ''
+        env:
+          CONFIG_FILES: ${{ needs.detect-changes.outputs.config-files }}
+          CONFIG_HASHES: ${{ needs.detect-changes.outputs.config-hashes }}
+        run: |
+          set -euo pipefail
+          set -f
+          rm -rf .server-config-stage
+          mkdir -m 700 .server-config-stage
+          for p in $CONFIG_FILES; do
+            if [ ! -f "$p" ] || [ -L "$p" ]; then
+              echo "::error::server-config-files: '$p' ist im Checkout keine normale Datei"
+              exit 1
+            fi
+            mkdir -p ".server-config-stage/$(dirname "$p")"
+            cp "$p" ".server-config-stage/$p"
+          done
+          IFS=',' read -r -a ENTRIES <<< "$CONFIG_HASHES"
+          for e in "${ENTRIES[@]}"; do
+            p="${e%%=*}"
+            h="${e#*=}"
+            if [ "$(sha256sum ".server-config-stage/$p" | cut -d' ' -f1)" != "$h" ]; then
+              echo "::error::server-config-files: Hash von '$p' weicht von detect-changes ab"
+              exit 1
+            fi
+          done
+
+      - name: Create server config staging dir on server
+        if: needs.detect-changes.outputs.config-files != ''
+        uses: appleboy/ssh-action@v1.2.5
+        with:
+          host: 46.224.6.69
+          username: root
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          timeout: 30s
+          command_timeout: 2m
+          script: |
+            rm -rf "${{ env.CFG_STAGE }}"
+            mkdir -m 700 "${{ env.CFG_STAGE }}"
+
+      - name: Upload server config files
+        if: needs.detect-changes.outputs.config-files != ''
+        uses: burnett01/rsync-deployments@7.0.1
+        with:
+          switches: -az --delete
+          path: .server-config-stage/
+          remote_path: ${{ env.CFG_STAGE }}/
+          remote_host: 46.224.6.69
+          remote_user: root
+          remote_key: ${{ secrets.SSH_PRIVATE_KEY }}
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -896,12 +1105,176 @@ jobs:
               fi
             done
 
+            # ── server-config-files: Konfigurationsdateien aus dem Repo am Ziel ablegen ──────────
+            # Ablauf: (1) alles prüfen, noch nichts verändern, (2) je geänderte Datei Sicherung mit
+            # Zeitstempel und atomarer Austausch, (3) docker compose pull/up, (4) Hash-Vergleich am
+            # Ziel gegen den Commit. Fehler vor compose up: Dateien aus den Sicherungen zurück
+            # (EXIT-Trap) und roter Lauf. Ab compose up bleiben die neuen Dateien liegen (die
+            # Container laufen mit ihnen), ein Fehler macht den Lauf rot.
+            SERVER_CONFIG_HASHES="${{ needs.detect-changes.outputs.config-hashes }}"
+            NGINX_CONFIG_CONTAINER="${{ inputs.nginx-config-container }}"
+            NGINX_CONFIG_FILE="${{ inputs.nginx-config-file }}"
+            CFG_STAGE="${{ env.CFG_STAGE }}"
+            CONFIG_DIR="${{ inputs.deploy-path }}"
+            CONFIG_ROLLBACK_LIST=""
+            CONFIG_ARMED=0
+            config_rollback() {
+              local rc=$? tgt bak
+              if [ "$CONFIG_ARMED" = 1 ] && [ "$rc" -ne 0 ]; then
+                CONFIG_ARMED=0
+                echo "::error::Abbruch vor docker compose up: eingespielte Konfigurationsdateien werden aus den Sicherungen zurückgespielt."
+                while IFS='|' read -r tgt bak; do
+                  [ -n "$tgt" ] || continue
+                  if [ -n "$bak" ]; then
+                    if cp -p "$bak" "$tgt.rollback.$$" && mv -f "$tgt.rollback.$$" "$tgt"; then
+                      echo "Zurückgerollt: $tgt"
+                    else
+                      echo "::error::Rückrollen von $tgt fehlgeschlagen, Sicherung liegt unter $bak"
+                    fi
+                  elif rm -f "$tgt"; then
+                    echo "Zurückgerollt (Datei war neu): $tgt"
+                  fi
+                done <<< "$CONFIG_ROLLBACK_LIST"
+              fi
+            }
+            config_hash_of() { # datei -> sha256 (Fehler bei nicht lesbarer Datei)
+              local out
+              out=$(sha256sum "$1") || return 1
+              printf '%s' "${out%% *}"
+            }
+            config_validate() {
+              local e p h src t
+              for e in "${CONFIG_ENTRIES[@]}"; do
+                p="${e%%=*}"; h="${e#*=}"; src="$CFG_STAGE/$p"
+                if [ ! -f "$src" ] || [ -L "$src" ]; then
+                  echo "::error::server-config-files: $p fehlt im Staging am Ziel. Nichts verändert."
+                  return 1
+                fi
+                if ! t=$(config_hash_of "$src") || [ "$t" != "$h" ]; then
+                  echo "::error::server-config-files: Hash von $p im Staging weicht vom Commit ab (Übertragung). Nichts verändert."
+                  return 1
+                fi
+                if [ -n "$NGINX_CONFIG_CONTAINER" ] && [ "$p" = "$NGINX_CONFIG_FILE" ]; then
+                  if [ -f "$CONFIG_DIR/$p" ] && cmp -s "$src" "$CONFIG_DIR/$p"; then
+                    continue
+                  fi
+                  if [ "$(docker inspect -f '{{.State.Running}}' "$NGINX_CONFIG_CONTAINER" 2>/dev/null)" != "true" ]; then
+                    echo "::error::nginx-Container $NGINX_CONFIG_CONTAINER läuft nicht, $p kann nicht mit nginx -t geprüft werden. Nichts verändert."
+                    return 1
+                  fi
+                  if ! docker cp "$src" "$NGINX_CONFIG_CONTAINER:/tmp/nginx-deploy-test.conf"; then
+                    echo "::error::$p konnte nicht in den nginx-Container kopiert werden. Nichts verändert."
+                    return 1
+                  fi
+                  if ! docker exec "$NGINX_CONFIG_CONTAINER" nginx -t -c /tmp/nginx-deploy-test.conf; then
+                    docker exec "$NGINX_CONFIG_CONTAINER" rm -f /tmp/nginx-deploy-test.conf || echo "::warning::Testdatei im nginx-Container nicht entfernt"
+                    echo "::error::nginx -t lehnt $p ab. Nichts verändert."
+                    return 1
+                  fi
+                  docker exec "$NGINX_CONFIG_CONTAINER" rm -f /tmp/nginx-deploy-test.conf || echo "::warning::Testdatei im nginx-Container nicht entfernt"
+                fi
+              done
+            }
+            config_install() {
+              local e p src tgt bak new ts
+              ts=$(date +%Y%m%d-%H%M%S)
+              for e in "${CONFIG_ENTRIES[@]}"; do
+                p="${e%%=*}"; src="$CFG_STAGE/$p"; tgt="$CONFIG_DIR/$p"
+                if [ -f "$tgt" ] && cmp -s "$src" "$tgt"; then
+                  echo "Konfiguration unverändert: $p"
+                  continue
+                fi
+                mkdir -p "$(dirname "$tgt")" || return 1
+                bak=""
+                if [ -e "$tgt" ]; then
+                  bak="$tgt.bak-$ts-deploy"
+                  if ! cp -p "$tgt" "$bak"; then
+                    echo "::error::Sicherung von $p fehlgeschlagen."
+                    return 1
+                  fi
+                fi
+                new="$tgt.new.$$"
+                if ! cp "$src" "$new"; then
+                  rm -f "$new"
+                  echo "::error::Kopieren von $p fehlgeschlagen."
+                  return 1
+                fi
+                if [ -n "$bak" ]; then
+                  # Modus und Besitzer der bisherigen Datei übernehmen
+                  if ! chmod --reference="$tgt" "$new" || ! chown --reference="$tgt" "$new"; then
+                    rm -f "$new"
+                    echo "::error::Modus oder Besitzer von $p nicht übernehmbar."
+                    return 1
+                  fi
+                else
+                  chmod 644 "$new" || { rm -f "$new"; return 1; }
+                fi
+                # Rückroll-Eintrag VOR dem Austausch vormerken
+                CONFIG_ROLLBACK_LIST="${CONFIG_ROLLBACK_LIST}${tgt}|${bak}"$'\n'
+                if ! mv -f "$new" "$tgt"; then
+                  rm -f "$new"
+                  echo "::error::Austausch von $p fehlgeschlagen."
+                  return 1
+                fi
+                echo "Konfiguration eingespielt: $p (Sicherung: ${bak:-keine, Datei war neu})"
+              done
+            }
+            config_verify() {
+              local e p h act c out nginx_hash=""
+              for e in "${CONFIG_ENTRIES[@]}"; do
+                p="${e%%=*}"; h="${e#*=}"
+                if ! act=$(config_hash_of "$CONFIG_DIR/$p"); then
+                  echo "::error::server-config-files: $p am Ziel nicht lesbar."
+                  return 1
+                fi
+                if [ "$act" != "$h" ]; then
+                  echo "::error::server-config-files: $p am Ziel weicht nach dem Deploy vom Commit ab."
+                  return 1
+                fi
+                if [ "$p" = "$NGINX_CONFIG_FILE" ]; then nginx_hash="$h"; fi
+              done
+              if [ -n "$NGINX_CONFIG_CONTAINER" ]; then
+                c="$NGINX_CONFIG_CONTAINER"
+                if ! out=$(docker exec "$c" sha256sum /etc/nginx/nginx.conf); then
+                  echo "::error::nginx-Container $c: /etc/nginx/nginx.conf nicht lesbar."
+                  return 1
+                fi
+                if [ "${out%% *}" != "$nginx_hash" ]; then
+                  echo "::error::nginx-Container $c hat nicht die ausgelieferte $NGINX_CONFIG_FILE geladen (Einzeldatei-Mount, Container nicht neu erzeugt?)."
+                  return 1
+                fi
+                if ! docker exec "$c" nginx -t; then
+                  echo "::error::nginx -t im Container $c schlägt nach dem Deploy fehl."
+                  return 1
+                fi
+              fi
+              echo "server-config-files: alle Dateien am Ziel entsprechen dem Commit"
+            }
+            if [ -n "$SERVER_CONFIG_HASHES" ]; then
+              IFS=',' read -r -a CONFIG_ENTRIES <<< "$SERVER_CONFIG_HASHES"
+              trap config_rollback EXIT
+              # Ohne Quick-Deploy-Sperre oben (kein app-container) hier die Sperre für den Deploy-Pfad.
+              if [ -z "${{ inputs.app-container }}" ]; then
+                if ! acquire_deploy_lock "$CONFIG_DIR" 300; then
+                  exit 1
+                fi
+              fi
+              if ! config_validate; then exit 1; fi
+              CONFIG_ARMED=1
+              if ! config_install; then exit 1; fi
+            fi
+
             compose_pull
 
             # Pre-deploy commands (e.g. migrations before up)
             ${{ inputs.pre-deploy-commands }}
 
+            CONFIG_ARMED=0
             compose_up
+
+            if [ -n "$SERVER_CONFIG_HASHES" ]; then
+              if ! config_verify; then exit 1; fi
+            fi
 
             # Post-deploy commands (cache, health check, etc.)
             ${{ inputs.post-deploy-commands }}
@@ -942,3 +1315,15 @@ jobs:
 
             # Cleanup old images (skip recently used to avoid race with concurrent deploys)
             docker image prune -f --filter "until=1h"
+
+      # Staging-Verzeichnis der Konfigurationsdateien am Ziel auch bei Fehler oder Abbruch entfernen.
+      - name: Remove server config staging dir on server
+        if: always() && needs.detect-changes.outputs.config-files != ''
+        uses: appleboy/ssh-action@v1.2.5
+        with:
+          host: 46.224.6.69
+          username: root
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          timeout: 30s
+          command_timeout: 1m
+          script: rm -rf "${{ env.CFG_STAGE }}"
