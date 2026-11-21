@@ -152,7 +152,11 @@ esac
 [ "$1" = "cp" ] && [ "${FAKE_FAIL:-}" = "cp" ] && exit 1
 if [ "$1 $2" = "compose pull" ] && [ -n "${FAKE_PULL_FAILS:-}" ]; then
   n=$(cat "$FAKE_LOG.pulln" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$FAKE_LOG.pulln"
-  if [ "$n" -le "$FAKE_PULL_FAILS" ]; then echo "${FAKE_PULL_MSG:-NotFound: content digest sha256:abc: not found}" >&2; exit 1; fi
+  if [ "$n" -le "$FAKE_PULL_FAILS" ]; then
+    echo "${FAKE_PULL_MSG:-NotFound: content digest sha256:abc: not found}" >&2
+    [ -n "${FAKE_PULL_LONG:-}" ] && head -c 600000 /dev/zero | tr '\0' 'x' | fold -w 80 >&2
+    exit 1
+  fi
 fi
 if [ "$1" = "compose" ] && [ "$2" = "config" ]; then printf 'app\nredis\n'; exit 0; fi
 if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "${FAKE_FAIL:-}" = "up" ]; then exit 1; fi
@@ -416,6 +420,10 @@ rm -f "$WORK/fake.log.pulln"
 FAKE_PULL_FAILS=9 FAKE_PULL_MSG="unauthorized: authentication required" PULL_RETRY_WAIT=0 run_full "" "$C4" app "$C1"; RC=$?
 [ "$RC" -ne 0 ] && ok "Pull: anderer Fehler -> Lauf rot" || fail "Pull: anderer Fehler wird verschluckt"
 expect "Pull: anderer Fehler wird NICHT wiederholt (ein Versuch)" "1" "$(grep -c '^docker compose pull' "$WORK/fake.log")"
+rm -f "$WORK/fake.log.pulln"
+FAKE_PULL_FAILS=1 FAKE_PULL_LONG=1 PULL_RETRY_WAIT=0 run_full "" "$C4" app "$C1"; RC=$?
+expect "Pull: Fehler steht VOR 600 kB Ausgabe (SIGPIPE-Fall) -> trotzdem Wiederholung, Exit 0" "0" "$RC"
+expect "Pull: ... zwei Versuche" "2" "$(grep -c '^docker compose pull' "$WORK/fake.log")"
 rm -f "$WORK/fake.log.pulln"
 
 echo "== Build-Label"
