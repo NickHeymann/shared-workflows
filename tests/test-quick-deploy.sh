@@ -127,6 +127,7 @@ fc_case() { # aenderungen (zeilenweise)  [PUBLIC_VOLUME wird vererbt]
   git init -q -b main "$dir"
   git -C "$dir" config user.email t@example.invalid
   git -C "$dir" config user.name Test
+  git -C "$dir" config core.excludesFile /dev/null
   git -C "$dir" remote add origin "$WORK/fc-origin.git"
   local base_files="resources/views/a.blade.php lang/de/a.php resources/css/app.css resources/js/app.js public/build/x.js public/images/a.png docker/x.conf scripts/x.sh docker-entrypoint.sh docker-compose.yml Dockerfile resources/markdown/a.md public/favicon.ico README.md nginx.conf app/A.php"
   local f
@@ -179,7 +180,13 @@ M resources/js/app.js
 M public/images/a.png
 M lang/de/a.php")"
 expect "Umbenennung aus app/ heraus nach views (alter Pfad zählt) -> full" "quick=false" "$(fc_case "R app/A.php resources/views/b.blade.php")"
-expect "Umbenennung innerhalb views -> quick" "quick=true" "$(fc_case "R resources/views/a.blade.php resources/views/b.blade.php")"
+expect "Umbenennung innerhalb views (alte View bliebe im Container, Quick kopiert nur additiv) -> full" "quick=false" "$(fc_case "R resources/views/a.blade.php resources/views/b.blade.php")"
+grep -q 'Full build required due to: resources/views/a.blade.php' "$WORK/check.log" && ok "Umbenennung: Log nennt den alten Pfad" || fail "Umbenennung: Log nennt den alten Pfad nicht"
+expect "View gelöscht -> full" "quick=false" "$(fc_case "D resources/views/a.blade.php")"
+expect "public/build-Datei gelöscht -> full" "quick=false" "$(fc_case "D public/build/x.js")"
+expect "css gelöscht -> full" "quick=false" "$(fc_case "D resources/css/app.css")"
+expect "Löschung gemischt mit Views-Änderung -> full" "quick=false" "$(fc_case "M resources/views/a.blade.php
+D public/images/a.png")"
 expect "leere Dateiliste (Rerun desselben Stands) -> quick" "quick=true" "$(fc_case "")"
 expect "ohne public-volume-path: resources/js -> full" "quick=false" "$(PUBLIC_VOLUME= fc_case "M resources/js/app.js")"
 grep -q 'kein public-volume-path' "$WORK/check.log" && ok "ohne public-volume-path: Log nennt den Grund" || fail "ohne public-volume-path: kein Grund im Log"
