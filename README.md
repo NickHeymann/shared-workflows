@@ -110,6 +110,36 @@ ergänzen (die Eingabe ersetzt den Standard, also die Standardliste mitgeben).
 Verfügbar ab der Version, die diese Änderung trägt (siehe Tag-Liste im PR); ältere Tags
 behalten das alte Verhalten.
 
+## Quick-Deploy: Basis-Vermerk und Guards
+
+Der Quick-Deploy (Views, Sprachdateien, CSS/JS, Bilder ohne Image-Build) ist nur aktiv,
+wenn das Repo `app-container` setzt.
+
+**Basis statt Vorgänger-Commit.** Früher verglich `detect-changes` nur `HEAD~1` mit `HEAD`.
+Brach `concurrency: cancel-in-progress` (oder ein Handabbruch, ein Fehlschlag) den Lauf
+für Commit A ab und der Folge-Commit B enthielt nur Views oder `nginx.conf`, übertrug der
+Quick-Deploy von B nur B's Diff: die PHP-Änderungen von A kamen nie an, obwohl `main` grün
+meldete (nickheymann-tall, 76681c7 und e0988ad, 21.11.2026).
+
+Jetzt schreibt jeder erfolgreiche Deploy am Ziel den ausgerollten Commit nach
+`<deploy-path>/.quick-deploy-basis` (Full-Deploy nach compose up, post-deploy-commands und
+Extra-Pfaden; Quick-Deploy nach Kopieren und Cache-Reset; atomar über `.tmp` + `mv`, nur bei
+gesetztem `app-container`). `detect-changes` liest ihn per ssh und diffet `Basis..HEAD`.
+Der Full-Deploy läuft (fail closed), wenn der Vermerk fehlt, kein 40-stelliger SHA ist, nicht
+lesbar ist oder der Basis-Commit nicht abrufbar ist. Folge: der erste Deploy nach der
+Umstellung auf eine Version mit Basis-Vermerk ist immer ein Full-Deploy (Vermerk fehlt noch).
+
+Eine Wiederholung eines alten Laufs setzt den Vermerk auf dessen Commit zurück (der Stand am
+Ziel ist dann tatsächlich der alte); der nächste Push holt die Differenz nach.
+
+**`public/images/` ist optional.** Wie `lang/` wird das Verzeichnis nur hochgeladen und
+kopiert, wenn es im Repo existiert (master-admin hat keins im Git; ohne Guard brach der
+rsync-Schritt ab).
+
+Test (Trockenlauf des Shell-Teils gegen ein Attrappen-Repo, loest keinen Deploy aus):
+`tests/test-quick-deploy.sh` (Voraussetzung: bash, git, ruby). Mit einer älteren Fassung der
+Workflow-Datei als Argument muss er rot werden.
+
 ## Tooling (on the Mac, ~/.claude/scripts/ci/)
 
 | Script | Purpose |
