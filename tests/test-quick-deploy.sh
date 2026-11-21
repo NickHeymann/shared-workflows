@@ -150,7 +150,7 @@ esac
 [ "$1" = "cp" ] && echo "marker-bei-cp=$([ -e "$MARKER" ] && echo da || echo weg)" >> "$FAKE_LOG"
 [ "$1" = "cp" ] && [ -n "${FAKE_CONCURRENT:-}" ] && echo "$FAKE_CONCURRENT" > "$MARKER"   # anderer Deploy schreibt mitten im Lauf seinen Vermerk
 [ "$1" = "cp" ] && [ "${FAKE_FAIL:-}" = "cp" ] && exit 1
-if [ "$1 $2" = "compose pull" ] && [ -n "${FAKE_PULL_FAILS:-}" ]; then
+if { [ "$1 $2" = "compose pull" ] || [ "$1" = "pull" ]; } && [ -n "${FAKE_PULL_FAILS:-}" ]; then
   n=$(cat "$FAKE_LOG.pulln" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$FAKE_LOG.pulln"
   if [ "$n" -le "$FAKE_PULL_FAILS" ]; then
     echo "${FAKE_PULL_MSG:-NotFound: content digest sha256:abc: not found}" >&2
@@ -493,6 +493,19 @@ if [ -n "${TEST_NODOCKERLOCK:-}" ]; then fail "Deploy-Frist gegen langen Prune (
 [ "$RC" -ne 0 ] && grep -q 'Docker-Sperre (geteilt) nicht erhalten' "$WORK/d-full.out" && ok "Langer Prune: Deploy bricht laut ab (Exit $RC)" || fail "Langer Prune: Deploy ohne lauten Abbruch (Exit $RC)"
 expect "Langer Prune: nichts ausgerollt (kein compose pull)" "0" "$(grep -c 'compose pull' "$WORK/fake.log")"
 fi
+
+echo "== Basis-Images im Quick-Deploy (Pull-Wiederholung)"
+rm -rf "$WORK/qb"; mkdir -p "$WORK/qb"
+NODE_VERSION=22 "$EXTRACT" "$WF" quick-deploy "Setup PHP + Node + build assets" > "$WORK/qb.sh" || fail "Extraktion Setup-Schritt"
+run_qb() { rm -f "$WORK/fake.log.pulln"; : > "$WORK/fake.log"; (cd "$WORK/qb" && PATH="$BIN:$PATH" NODE_VERSION=22 FAKE_LOG="$WORK/fake.log" PULL_RETRY_WAIT=0 env "$@" bash "$WORK/qb.sh" > "$WORK/qb.out" 2>&1); }
+run_qb FAKE_PULL_FAILS=1; RC=$?
+expect "Basis-Image: ein NotFound-Fehler, Wiederholung gelingt -> Exit 0" "0" "$RC"
+grep -q 'Versuch 1 von 3' "$WORK/qb.out" && ok "Basis-Image: laute Warnung" || fail "Basis-Image: keine Warnung"
+run_qb FAKE_PULL_FAILS=9; RC=$?
+[ "$RC" -ne 0 ] && grep -q 'scheiterte 3 Mal' "$WORK/qb.out" && ok "Basis-Image: dauerhaft NotFound -> rot nach 3 Versuchen" || fail "Basis-Image: dauerhafter Fehler nicht rot (Exit $RC)"
+expect "Basis-Image: nichts gestartet (kein docker run)" "0" "$(grep -c '^docker run' "$WORK/fake.log")"
+run_qb FAKE_PULL_FAILS=9 "FAKE_PULL_MSG=unauthorized: x"; RC=$?
+expect "Basis-Image: anderer Fehler wird nicht wiederholt (ein Pull)" "1" "$(grep -c '^docker pull' "$WORK/fake.log")"
 
 echo "== Build-Label"
 BUILD_LABEL=$(ruby -ryaml -e 'wf=YAML.load_file(ARGV[0]); s=wf["jobs"]["full-deploy"]["steps"].find{|x| x["name"]=="Build and push Docker image"}; puts s["with"]["labels"]' "$WF")
