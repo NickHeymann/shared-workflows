@@ -154,6 +154,11 @@ Jetzt gilt ein Basis-Vermerk am Ziel (`<deploy-path>/.quick-deploy-basis`, nur b
   Quick und Full, nur wenn ein Vermerk existiert). Gleicher Commit (Rerun desselben Stands) läuft
   normal. Lässt sich die Historie nicht vollständig laden, bricht der Lauf ab. Der Full-Deploy prüft unter der
   Server-Sperre erneut, dass der Vermerk noch der geprüfte ist (sonst Abbruch, Lauf wiederholen). Für einen bewussten Rückschritt: Revert-Commit pushen oder den Vermerk am Ziel löschen.
+- `docker compose pull` wird bei dem Fehler `NotFound: content digest` (und `lease does not exist`) des
+  containerd-Image-Speichers höchstens dreimal im Abstand von 15 Sekunden wiederholt, mit lauter
+  Warnung je Versuch und Fehlermeldung nach dem dritten. Ursache ist ein gleichzeitiger
+  `docker image prune` auf dem gemeinsamen Server, der die Lease eines laufenden Pulls löscht
+  (moby/moby#53321). Jeder andere Pull-Fehler schlägt sofort fehl.
 - `nginx.conf` wird von keinem der beiden Deploys ausgerollt (am Server von Hand gepflegt). Ändert
   sich die Datei, meldet der Lauf das als Warnung und in der Zusammenfassung, statt sie still als
   ausgerollt zu führen.
