@@ -159,19 +159,6 @@ Jetzt gilt ein Basis-Vermerk am Ziel (`<deploy-path>/.quick-deploy-basis`, nur b
   Warnung je Versuch und Fehlermeldung nach dem dritten. Ursache ist ein gleichzeitiger
   `docker image prune` auf dem gemeinsamen Server, der die Lease eines laufenden Pulls löscht
   (moby/moby#53321). Jeder andere Pull-Fehler schlägt sofort fehl.
-- **Hostweite Docker-Sperre** (eigentliche Ursache dieses Fehlers): Der Full-Deploy hält
-  `/var/lock/docker-image.lock` **geteilt** (`flock -s`, Frist 300 s) von vor `docker compose pull` bis
-  nach `compose up` und den Post-Deploy-Befehlen. Jedes Aufräumen (`docker image prune`, `builder prune`)
-  muss sie **exklusiv** halten (`flock -x`) und wartet nur begrenzt: ist sie nicht frei, wird das Aufräumen
-  übersprungen, statt in einen Deploy zu laufen. Das Aufräumen am Ende des Deploys folgt derselben Regel
-  (Sperre geteilt freigeben, dann exklusiv mit 60 s Frist, bei Frist übersprungen mit Warnung). Hält ein
-  Prune die Sperre länger als 300 s, bricht der Deploy laut ab, bevor etwas ausgerollt ist. Server-Skripte
-  mit Prune (Cron, Aufräumskripte) müssen auf dieselbe Sperre umgestellt werden, sonst bleibt nur die
-  Wiederholung oben als zweite Sicherung. Der Quick-Deploy zieht kein Deploy-Image und braucht die Sperre
-  nicht. Grenze: die Schritte, die im Runner-Container laufen (Basis-Images `php`/`node` des Quick-Deploys,
-  `alpine` des Build-Platzes), sehen die Sperre des Hosts nicht. Dort gilt nur die Wiederholung (Pull der
-  Basis-Images nur bei lokalem Fehlen, unmittelbar vor dem Start, mit höchstens drei Versuchen bei `NotFound: content digest`). Eine vollständige Lösung
-  bräuchte `/run/lock` als Bind-Mount in den Runner-Containern (Serveränderung, offene Entscheidung).
 - `nginx.conf` wird von keinem der beiden Deploys ausgerollt (am Server von Hand gepflegt). Ändert
   sich die Datei, meldet der Lauf das als Warnung und in der Zusammenfassung, statt sie still als
   ausgerollt zu führen.
