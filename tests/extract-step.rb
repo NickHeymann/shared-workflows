@@ -18,4 +18,5 @@ abort "Schritt nicht gefunden: #{job}/#{wanted}" unless step
 text = key == 'script' ? step.fetch('with').fetch('script') : step.fetch('run')
 text = text.gsub(/\$\{\{\s*inputs\.([a-z-]+)\s*\}\}/) { ENV.fetch("INPUT_#{Regexp.last_match(1).tr('-', '_').upcase}", '') }
 text = text.gsub(/\$\{\{\s*github\.sha\s*\}\}/) { ENV.fetch('GITHUB_SHA_VALUE', '') }
+text = text.gsub(/\$\{\{\s*env\.STAGING_DIR\s*\}\}/) { ENV.fetch('STAGING_DIR_VALUE', '/tmp/quick-deploy-RUN-1') }
 print text
