@@ -1006,6 +1006,10 @@ jobs:
               done
               echo "Zustandsdienste (kein Zwangs-Neustart):${keep:- keine}"
               echo "Anwendungsdienste (--force-recreate):${app:- keine}"
+              # Ab hier verändert compose die Container: Konfigurationsdateien (server-config-files)
+              # werden bei einem Fehler nicht mehr zurückgerollt. Bis hierher (auch bei einem Fehler
+              # von compose config oben) greift das Rückrollen.
+              CONFIG_ARMED=0
               # 1) Zustandsdienste: Compose erzeugt nur bei geaendertem Image oder
               #    geaenderter Konfiguration neu, fehlende Dienste werden gestartet.
               #    --wait (laufend, mit Healthcheck gesund) ersetzt die Bereitschaft, die
@@ -1128,10 +1132,25 @@ jobs:
               out=$(sha256sum "$1") || return 1
               printf '%s' "${out%% *}"
             }
+            # Kein Bestandteil des Zielpfads unterhalb des deploy-path darf ein Symlink sein
+            # (sonst schriebe Sicherung oder Austausch an eine Stelle außerhalb des deploy-path).
+            config_path_safe() { # relativer pfad
+              local rest="$1" cur="$CONFIG_DIR" part
+              while [ -n "$rest" ]; do
+                part="${rest%%/*}"
+                if [ "$part" = "$rest" ]; then rest=""; else rest="${rest#*/}"; fi
+                cur="$cur/$part"
+                if [ -L "$cur" ]; then
+                  echo "::error::server-config-files: $cur ist ein Symlink, kein Einspielen außerhalb des deploy-path. Nichts verändert."
+                  return 1
+                fi
+              done
+            }
             config_validate() {
               local e p h src t
               for e in "${CONFIG_ENTRIES[@]}"; do
                 p="${e%%=*}"; h="${e#*=}"; src="$CFG_STAGE/$p"
+                if ! config_path_safe "$p"; then return 1; fi
                 if [ ! -f "$src" ] || [ -L "$src" ]; then
                   echo "::error::server-config-files: $p fehlt im Staging am Ziel. Nichts verändert."
                   return 1
@@ -1255,7 +1274,6 @@ jobs:
             # Pre-deploy commands (e.g. migrations before up)
             ${{ inputs.pre-deploy-commands }}
 
-            CONFIG_ARMED=0
             compose_up
 
             if [ -n "$SERVER_CONFIG_HASHES" ]; then
