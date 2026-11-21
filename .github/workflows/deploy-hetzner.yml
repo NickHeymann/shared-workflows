@@ -74,6 +74,7 @@ jobs:
     runs-on: ${{ inputs.runner }}
     outputs:
       quick: ${{ steps.check.outputs.quick }}
+      base: ${{ steps.check.outputs.base }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -139,6 +140,7 @@ jobs:
             full_deploy "Diff gegen Basis $BASE fehlgeschlagen"
           fi
           echo "Basis (zuletzt ausgerollt): $BASE"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
           echo "Changed files since basis:"
           echo "$CHANGED"
 
@@ -309,13 +311,14 @@ jobs:
           OPCACHE_RESET_URL: ${{ inputs.opcache-reset-url }}
           DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
           HAS_IMAGES: ${{ steps.has-images.outputs.exists }}
+          EXPECTED_BASE: ${{ needs.detect-changes.outputs.base }}
         with:
           host: 46.224.6.69
           username: root
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           # OPCACHE_RESET_URL + DEPLOY_TOKEN via envs (NOT interpolated into the
           # script string) so the token never lands in the command line / logs.
-          envs: OPCACHE_RESET_URL,DEPLOY_TOKEN,HAS_IMAGES
+          envs: OPCACHE_RESET_URL,DEPLOY_TOKEN,HAS_IMAGES,EXPECTED_BASE
           timeout: 30s
           command_timeout: 5m
           script: |
@@ -324,10 +327,23 @@ jobs:
             VOLUME="${{ inputs.public-volume-path }}"
             BASIS_FILE="${{ inputs.deploy-path }}/.quick-deploy-basis"
 
-            # Basis-Vermerk ungültig machen, BEVOR das Ziel verändert wird: bricht dieser
-            # Lauf ab (cancel, Fehler), gilt kein veralteter Vermerk weiter, und der nächste
-            # Deploy fällt auf Full-Deploy zurück.
-            rm -f "$BASIS_FILE" "$BASIS_FILE.tmp"
+            # Basis-Vermerk beanspruchen UND ungültig machen, BEVOR das Ziel verändert wird:
+            # bricht dieser Lauf ab (cancel, Fehler), gilt kein veralteter Vermerk weiter,
+            # und der nächste Deploy fällt auf Full-Deploy zurück. Das Umbenennen ist atomar:
+            # hat ein anderer Deploy den Vermerk inzwischen gelöscht oder ersetzt (Stand am
+            # Ziel nicht mehr der, auf dem detect-changes entschieden hat), bricht dieser
+            # Quick-Deploy ab, ohne etwas zu verändern.
+            rm -f "$BASIS_FILE.tmp" "$BASIS_FILE.claimed"
+            if ! mv "$BASIS_FILE" "$BASIS_FILE.claimed"; then
+              echo "::error::Basis-Vermerk nicht mehr vorhanden, Stand am Ziel hat sich geändert. Nichts ausgerollt, nächster Deploy ist ein Full-Deploy."
+              exit 1
+            fi
+            CLAIMED_BASE=$(head -n 1 "$BASIS_FILE.claimed" | tr -d '[:space:]')
+            rm -f "$BASIS_FILE.claimed"
+            if [ -z "$EXPECTED_BASE" ] || [ "$CLAIMED_BASE" != "$EXPECTED_BASE" ]; then
+              echo "::error::Basis am Ziel ($CLAIMED_BASE) weicht von der Entscheidungsgrundlage ($EXPECTED_BASE) ab. Nichts ausgerollt, nächster Deploy ist ein Full-Deploy."
+              exit 1
+            fi
 
             docker cp /tmp/quick-deploy/resources/views/. "$CONTAINER":/var/www/resources/views/
             if [ -d /tmp/quick-deploy/lang ]; then
@@ -397,7 +413,14 @@ jobs:
               echo "WARN: Basis-Vermerk nicht geschrieben (OPcache-Reset fehlgeschlagen), nächster Deploy ist ein Full-Deploy"
             else
               printf '%s\n' "${{ github.sha }}" > "$BASIS_FILE.tmp"
-              mv "$BASIS_FILE.tmp" "$BASIS_FILE"
+              # ln schlägt fehl, wenn inzwischen ein anderer Deploy einen Vermerk geschrieben
+              # hat (dessen Stand gilt dann, ein Quick-Deploy überschreibt nie einen Full-Deploy).
+              if ln "$BASIS_FILE.tmp" "$BASIS_FILE"; then
+                rm -f "$BASIS_FILE.tmp"
+              else
+                rm -f "$BASIS_FILE.tmp"
+                echo "WARN: Basis-Vermerk von einem anderen Deploy gesetzt, bleibt bestehen"
+              fi
             fi
             echo "Quick deploy done (Basis ${{ github.sha }})"
 
@@ -641,6 +664,14 @@ jobs:
             if [ -n "${{ inputs.app-container }}" ]; then
               rm -f "${{ inputs.deploy-path }}/.quick-deploy-basis" "${{ inputs.deploy-path }}/.quick-deploy-basis.tmp"
             fi
+            # Extra-Pfade bekommen ebenfalls neuen Code: ein eigener Vermerk dort (der Pfad
+            # kann auch Hauptpfad eines anderen Deploys sein) darf nicht gültig bleiben.
+            printf '%s\n' "${{ inputs.extra-deploy-paths }}" | while IFS= read -r extra; do
+              extra=$(echo "$extra" | xargs)
+              if [ -n "$extra" ]; then
+                rm -f "$extra/.quick-deploy-basis" "$extra/.quick-deploy-basis.tmp"
+              fi
+            done
 
             docker compose pull
 

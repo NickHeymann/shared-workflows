@@ -133,6 +133,12 @@ Jetzt gilt ein Basis-Vermerk am Ziel (`<deploy-path>/.quick-deploy-basis`, nur b
   `github.sha`), also gebunden an das wirklich gestartete Image und nicht an einen Lauf, dessen
   `:latest` überschrieben wurde. Quick-Deploy nach Kopieren und gelungenem OPcache-Reset
   (scheitert der Reset, bleibt der Vermerk weg).
+- Der Quick-Deploy beansprucht den Vermerk per atomarem Umbenennen und vergleicht ihn mit der
+  Basis, auf der `detect-changes` entschieden hat. Hat ein anderer Deploy den Stand am Ziel
+  inzwischen geändert (Vermerk weg oder anders), bricht er rot ab, ohne etwas auszurollen. Er
+  überschreibt nie einen Vermerk, den ein anderer Deploy inzwischen gesetzt hat. Der Full-Deploy
+  löscht zusätzlich die Vermerke seiner Extra-Pfade. Eine echte Deploy-Sperre über alle Läufe
+  gibt es nicht (die Aufrufer bündeln Läufe je Repo per `concurrency`).
 - `detect-changes` liest ihn per ssh und diffet `Basis..HEAD`. Der Full-Deploy läuft (fail
   closed), wenn der Vermerk fehlt, kein 40-stelliger SHA ist, nicht lesbar ist oder der
   Basis-Commit nicht abrufbar ist. Folge: der erste Deploy nach der Umstellung auf eine Version

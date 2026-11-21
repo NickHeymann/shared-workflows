@@ -117,6 +117,7 @@ case "$1 $2" in
   "compose pull"|"compose up") echo "marker-bei-$1-$2=$([ -e "$MARKER" ] && echo da || echo weg)" >> "$FAKE_LOG" ;;
 esac
 [ "$1" = "cp" ] && echo "marker-bei-cp=$([ -e "$MARKER" ] && echo da || echo weg)" >> "$FAKE_LOG"
+[ "$1" = "cp" ] && [ -n "${FAKE_CONCURRENT:-}" ] && echo "$FAKE_CONCURRENT" > "$MARKER"   # anderer Deploy schreibt mitten im Lauf seinen Vermerk
 [ "$1" = "cp" ] && [ "${FAKE_FAIL:-}" = "cp" ] && exit 1
 if [ "$1" = "compose" ] && [ "$2" = "config" ]; then printf 'app\nredis\n'; exit 0; fi
 if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "${FAKE_FAIL:-}" = "up" ]; then exit 1; fi
@@ -150,6 +151,7 @@ run_quick() { # fail usr2fail curlcode vorhandener-vermerk -> schreibt $SERVER/a
     "$EXTRACT" "$WF" quick-deploy "Apply + clear caches" --key script \
     | sed -e "s|/tmp/quick-deploy|$WORK/qd|g" -e "s|/tmp/opcache-reset.out|$WORK/opcache.out|g" > "$WORK/apply.sh"
   PATH="$BIN:$PATH" FAKE_LOG="$WORK/fake.log" MARKER="$SERVER/app/.quick-deploy-basis" FAKE_FAIL="$1" FAKE_USR2_FAIL="$2" FAKE_CURL_CODE="$3" \
+    FAKE_CONCURRENT="${QUICK_CONCURRENT:-}" EXPECTED_BASE="${QUICK_EXPECTED-$4}" \
     OPCACHE_RESET_URL="https://x.invalid/reset" DEPLOY_TOKEN=t HAS_IMAGES=false \
     bash -e "$WORK/apply.sh" > "$WORK/apply.out" 2>&1
 }
@@ -168,13 +170,23 @@ expect "Quick: Reset-URL 500, USR2 gelingt -> Vermerk" "$C4" "$(marker "$SERVER/
 run_quick cp 0 200 "$C1"; RC=$?
 [ "$RC" -ne 0 ] && ok "Quick: docker cp scheitert -> Lauf rot" || fail "Quick: docker cp scheitert, Lauf nicht rot"
 expect "Quick: ... und der alte Vermerk bleibt NICHT gültig" "-" "$(marker "$SERVER/app")"
+QUICK_EXPECTED="$C0" run_quick "" 0 200 "$C1"; RC=$?
+[ "$RC" -ne 0 ] && ok "Quick: Vermerk am Ziel weicht von der Entscheidungsgrundlage ab -> Lauf rot" || fail "Quick: abweichende Basis nicht abgelehnt"
+expect "Quick: ... nichts kopiert (kein docker cp)" "0" "$(grep -c '^docker cp' "$WORK/fake.log")"
+expect "Quick: ... und kein Vermerk" "-" "$(marker "$SERVER/app")"
+run_quick "" 0 200 ""; RC=$?
+[ "$RC" -ne 0 ] && ok "Quick: Vermerk inzwischen gelöscht (anderer Deploy) -> Lauf rot, nichts kopiert" || fail "Quick: fehlender Vermerk nicht abgelehnt"
+expect "Quick: ... kein docker cp" "0" "$(grep -c '^docker cp' "$WORK/fake.log")"
+QUICK_CONCURRENT="$OTHER" run_quick "" 0 200 "$C1"; RC=$?
+expect "Quick: schreibt der Full-Deploy eines anderen Laufs mitten drin seinen Vermerk, wird er nicht überschrieben" "$OTHER" "$(marker "$SERVER/app")"
 expect "Quick: images nur mit HAS_IMAGES kopiert (Skript)" "1" "$(grep -c 'HAS_IMAGES" = "true"' "$WORK/apply.sh")"
 
-run_full() { # fail label app-container vorhandener-vermerk
-  SERVER="$WORK/server-full"; rm -rf "$SERVER"; mkdir -p "$SERVER/app"
+run_full() { # fail label app-container vorhandener-vermerk  (FULL_EXTRA: Extra-Pfade, je mit altem Vermerk)
+  SERVER="$WORK/server-full"; rm -rf "$SERVER"; mkdir -p "$SERVER/app" "$SERVER/staging"
   [ -n "$4" ] && echo "$4" > "$SERVER/app/.quick-deploy-basis"
+  [ -n "${FULL_EXTRA:-}" ] && echo "$C1" > "$SERVER/staging/.quick-deploy-basis"
   : > "$WORK/fake.log"
-  INPUT_DEPLOY_PATH="$SERVER/app" INPUT_APP_CONTAINER="$3" GITHUB_SHA_VALUE="$SHA_VALUE" INPUT_STATEFUL_SERVICES="redis" INPUT_PRE_DEPLOY_COMMANDS="" INPUT_POST_DEPLOY_COMMANDS="" INPUT_EXTRA_DEPLOY_PATHS="" \
+  INPUT_DEPLOY_PATH="$SERVER/app" INPUT_APP_CONTAINER="$3" GITHUB_SHA_VALUE="$SHA_VALUE" INPUT_STATEFUL_SERVICES="redis" INPUT_PRE_DEPLOY_COMMANDS="" INPUT_POST_DEPLOY_COMMANDS="" INPUT_EXTRA_DEPLOY_PATHS="${FULL_EXTRA:+$SERVER/staging}" \
     "$EXTRACT" "$WF" full-deploy "Deploy to Hetzner" --key script > "$WORK/full.sh"
   PATH="$BIN:$PATH" FAKE_LOG="$WORK/fake.log" MARKER="$SERVER/app/.quick-deploy-basis" FAKE_FAIL="$1" FAKE_LABEL="$2" GHCR_TOKEN=x \
     bash "$WORK/full.sh" > "$WORK/full.out" 2>&1
@@ -195,6 +207,10 @@ expect "Full: docker inspect scheitert -> kein Vermerk" "-" "$(marker "$SERVER/a
 run_full up "$C4" app "$C1"; RC=$?
 [ "$RC" -ne 0 ] && ok "Full: compose up scheitert -> Lauf rot" || fail "Full: compose up scheitert, Lauf nicht rot"
 expect "Full: ... und der alte Vermerk bleibt NICHT gültig" "-" "$(marker "$SERVER/app")"
+FULL_EXTRA=1 run_full up "$C4" app "$C1"; RC=$?
+expect "Full: Vermerk eines Extra-Pfads wird vor der ersten Änderung ebenfalls ungültig (auch bei Abbruch)" "-" "$(marker "$SERVER/staging")"
+FULL_EXTRA=1 run_full "" "$C4" app "$C1"; RC=$?
+expect "Full: Extra-Pfad bekommt keinen eigenen Vermerk" "-" "$(marker "$SERVER/staging")"
 run_full "" "$C4" "" "$C1"; RC=$?
 expect "Full ohne app-container: vorhandener Vermerk bleibt unberührt" "$C1" "$(marker "$SERVER/app")"
 run_full "" "$C4" "" ""; RC=$?
