@@ -242,6 +242,31 @@ jobs:
           # `container: image: php:8.4-cli` -- hier dieselbe Idee, nur als
           # einzelner `docker run`-Schritt statt Job-Container, weil
           # spaetere Schritte (SSH-Deploy) auf dem Host laufen muessen.
+          # Basis-Images vorab holen, mit begrenzter Wiederholung beim NotFound-Fehler des
+          # containerd-Speichers (gleichzeitiger docker image prune, moby/moby#53321). Der Runner
+          # läuft in einem Container ohne Zugriff auf die Sperre des Hosts, deshalb gibt es hier nur
+          # die Wiederholung als Sicherung, nicht die hostweite Sperre.
+          pull_base() {
+            local img="$1" attempt=1 max=3 out rc
+            while :; do
+              if out=$(docker pull "$img" 2>&1); then return 0; else rc=$?; fi
+              printf '%s\n' "$out"
+              case "$out" in
+                *"NotFound: content digest"*|*"lease does not exist"*) ;;
+                *) return "$rc" ;;
+              esac
+              if [ "$attempt" -ge "$max" ]; then
+                echo "::error::docker pull $img scheiterte $max Mal an fehlendem Inhalt im Image-Speicher (NotFound: content digest)."
+                return "$rc"
+              fi
+              echo "::warning::docker pull $img: Inhalt im Image-Speicher fehlt (vermutlich gleichzeitiger docker image prune). Versuch $attempt von $max, neuer Versuch in ${PULL_RETRY_WAIT:-15} Sekunden."
+              attempt=$((attempt + 1))
+              sleep "${PULL_RETRY_WAIT:-15}"
+            done
+          }
+          pull_base php:8.4-cli
+          pull_base "node:${NODE_VERSION}"
+
           docker run --rm -v "$PWD":/app -w /app php:8.4-cli sh -c '
             set -e
             export DEBIAN_FRONTEND=noninteractive
