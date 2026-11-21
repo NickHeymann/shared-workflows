@@ -116,6 +116,7 @@ jobs:
         id: check
         env:
           APP_CONTAINER: ${{ inputs.app-container }}
+          PUBLIC_VOLUME: ${{ inputs.public-volume-path }}
           BASIS_RAW: ${{ steps.basis.outputs.stdout }}
         run: |
           # Quick deploy only possible if app-container is configured
@@ -166,9 +167,14 @@ jobs:
               full_deploy "Vorfahren-Prüfung gegen Basis $BASE nicht möglich (Exit $ANC)"
             fi
           fi
-          if ! CHANGED=$(git diff --name-only "$BASE" HEAD); then
+          # --no-renames: eine Umbenennung erscheint als Löschung (alter Pfad) plus Neuanlage, sonst
+          # fehlte der alte Pfad in der Prüfung. name-status zeigt Löschungen. core.quotepath=false
+          # lässt Umlaute lesbar, Pfade mit Steuerzeichen bleiben in Anführungszeichen und passen auf
+          # keine Quick-Regel (fail closed).
+          if ! STATUS=$(git -c core.quotepath=false diff --name-status --no-renames "$BASE" HEAD); then
             full_deploy "Diff gegen Basis $BASE fehlgeschlagen"
           fi
+          CHANGED=$(printf '%s\n' "$STATUS" | cut -f2-)
           echo "Basis (zuletzt ausgerollt): $BASE"
           echo "Changed files since basis:"
           echo "$CHANGED"
@@ -182,24 +188,59 @@ jobs:
             [ -n "${GITHUB_STEP_SUMMARY:-}" ] && echo "**Hinweis:** $MSG" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          # Full rebuild required for these file types
-          FULL_PATTERN="^(Dockerfile|composer\.(json|lock)|package(-lock)?\.json|vite\.config\.[jt]s|tailwind\.config\.[jt]s|\.github/|app/|config/|database/|routes/|bootstrap/)"
-
+          # Quick-Liste (fail closed): Quick ist ein Deploy nur, wenn JEDE geänderte Datei auf einer
+          # der Regeln unten steht. Die Regeln spiegeln, was der Job quick-deploy wirklich ausrollt
+          # (additive Kopie von resources/views und lang, Vite-Build nach public/build, additive
+          # Kopie von public/images, Kopie von build und images nur mit public-volume-path; nur
+          # Neuanlagen und Änderungen, keine Löschungen oder Umbenennungen). Jede
+          # andere Datei (Dockerfile, docker/, scripts/, Compose-Dateien, resources/ außer views, css
+          # und js, public/ außer build und images, Wurzeldateien, nginx.conf ...) wird vom
+          # Quick-Deploy nicht ausgerollt und führt zum Full-Deploy.
           NEEDS_FULL=false
-          while IFS= read -r file; do
-            if echo "$file" | grep -qE "$FULL_PATTERN"; then
-              NEEDS_FULL=true
-              echo "Full build required due to: $file"
-              break
-            fi
-          done <<< "$CHANGED"
+          FULL_COUNT=0
+          full_because() { # datei grund
+            NEEDS_FULL=true
+            FULL_COUNT=$((FULL_COUNT + 1))
+            echo "Full build required due to: $1 ($2)"
+          }
+          classify_file() { # status datei
+            local st="$1" f="$2"
+            # Der Quick-Deploy kopiert nur additiv (docker cp, cp -r legen Dateien an oder
+            # überschreiben sie, entfernen aber nichts am Ziel; --delete wirkt nur im Staging).
+            # Gelöschte oder umbenannte Dateien (alter Pfad) kämen nie an: immer Full.
+            case "$st" in
+              A*|M*|T*) ;;
+              *) full_because "$f" "Status $st: der Quick-Deploy kopiert nur additiv und rollt Löschungen und Umbenennungen nicht aus"; return 0 ;;
+            esac
+            case "$f" in
+              resources/views/*)
+                return 0 ;;
+              lang/*)
+                # Upload-Schritt läuft nur, wenn lang/ im neuen Stand existiert
+                if [ -d lang ]; then return 0; fi
+                full_because "$f" "lang/ existiert im neuen Stand nicht, der Upload-Schritt entfällt" ;;
+              resources/css/*|resources/js/*|public/build/*|public/images/*)
+                # Eingaben bzw. Ergebnis des Vite-Builds und Bilder; am Ziel kommen public/build und
+                # public/images an, und nur mit public-volume-path
+                if [ -n "$PUBLIC_VOLUME" ]; then return 0; fi
+                full_because "$f" "kein public-volume-path: der Quick-Deploy kopiert public/build und public/images nicht ans Ziel" ;;
+              *)
+                full_because "$f" "nicht auf der Quick-Liste, der Quick-Deploy rollt diese Datei nicht aus" ;;
+            esac
+            return 0
+          }
+
+          while IFS=$'\t' read -r st file; do
+            [ -z "$file" ] && continue
+            classify_file "$st" "$file"
+          done <<< "$STATUS"
 
           if [ "$NEEDS_FULL" = "false" ]; then
             echo "quick=true" >> "$GITHUB_OUTPUT"
-            echo "Quick deploy (views/css/js/public only)"
+            echo "Quick deploy (alle geänderten Dateien auf der Quick-Liste)"
           else
             echo "quick=false" >> "$GITHUB_OUTPUT"
-            echo "Full Docker build required"
+            echo "Full Docker build required ($FULL_COUNT Datei(en) nicht auf der Quick-Liste oder nicht quick-fähig)"
           fi
 
   # ── Quick Deploy: rsync views + assets directly into container ───────────────
