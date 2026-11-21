@@ -43,6 +43,11 @@ C3=$(commit resources/views/b.blade.php v1 "Views")
 C4=$(commit resources/css/app.css css "CSS")
 git -C "$SRC" remote add origin "$ORIGIN"
 git -C "$SRC" push -q origin main
+# C5 liegt nach C4 (neuer ausgerollter Stand); der Runner baut C4 (alter Rerun)
+C5=$(commit resources/views/c.blade.php v2 "Views (neuerer Stand)")
+git -C "$SRC" push -q origin main
+git -C "$ORIGIN" update-ref refs/heads/main "$C4"
+git -C "$ORIGIN" update-ref refs/heads/neuer "$C5"
 
 # Runner-Klon wie actions/checkout mit fetch-depth 2
 runner_clone() {
@@ -91,6 +96,17 @@ expect "kein app-container -> full (unverändert)" "quick=false" "$(run_check "Q
 # Der Basis-Commit liegt außerhalb der Tiefe 2 und wird nachgeladen
 runner_clone
 git -C "$WORK/runner" cat-file -e "$C0^{commit}" 2>/dev/null && fail "Vorbedingung: C0 darf im flachen Klon nicht liegen" || ok "Vorbedingung: Basis liegt nicht im flachen Klon"
+
+# Schutz gegen alte Wiederholungen: HEAD ist C4
+expect "alter Rerun: Basis ist neuer als HEAD (Vorfahr) -> Abbruch" "exit1" "$(run_check "QUICK_DEPLOY_BASIS=$C5" app)"
+grep -q 'älter als der am Ziel' "$WORK/check.log" && ok "alter Rerun: klare Meldung" || fail "alter Rerun: keine klare Meldung"
+expect "Rerun desselben Commits (Basis=HEAD) -> kein Abbruch" "quick=true" "$(run_check "QUICK_DEPLOY_BASIS=$C4" app)"
+expect "Vorfahren-Prüfung greift vor der Einstufung (gilt für Quick und Full) -> Abbruch" "exit1" "$(run_check "QUICK_DEPLOY_BASIS=$C5" app)"
+# nginx.conf: ehrliche Meldung
+run_check "QUICK_DEPLOY_BASIS=$C1" app > /dev/null
+grep -q 'nginx.conf hat sich geändert, wird aber NICHT ausgerollt' "$WORK/check.log" && ok "nginx.conf-Änderung: Lauf meldet, dass sie nicht ausgerollt wird" || fail "nginx.conf: keine ehrliche Meldung"
+run_check "QUICK_DEPLOY_BASIS=$C3" app > /dev/null
+grep -q 'nginx.conf' "$WORK/check.log" && fail "nginx-Hinweis ohne nginx-Änderung" || ok "ohne nginx.conf-Änderung kein nginx-Hinweis"
 
 echo "== public/images-Guard"
 run_has_images() { # mit|ohne
@@ -179,7 +195,7 @@ run_quick() { # fail usr2fail curlcode vorhandener-vermerk -> schreibt $SERVER/a
   : > "$WORK/fake.log"
   INPUT_DEPLOY_PATH="$SERVER/app" INPUT_APP_CONTAINER=app INPUT_PUBLIC_VOLUME_PATH="" GITHUB_SHA_VALUE="$SHA_VALUE" \
     "$EXTRACT" "$WF" quick-deploy "Apply + clear caches" --key script \
-    | sed -e "s|/tmp/quick-deploy|$WORK/qd|g" -e "s|/tmp/opcache-reset.out|$WORK/opcache.out|g" | nolock > "$WORK/apply.sh"
+    | sed -e "s|/tmp/quick-deploy-RUN-1|$WORK/qd|g" -e "s|/tmp/opcache-reset.out|$WORK/opcache.out|g" | nolock > "$WORK/apply.sh"
   PATH="$BIN:$PATH" FAKE_LOG="$WORK/fake.log" MARKER="$SERVER/app/.quick-deploy-basis" FAKE_FAIL="$1" FAKE_USR2_FAIL="$2" FAKE_CURL_CODE="$3" \
     FAKE_CONCURRENT="${QUICK_CONCURRENT:-}" EXPECTED_BASE="${QUICK_EXPECTED-$4}" \
     OPCACHE_RESET_URL="https://x.invalid/reset" DEPLOY_TOKEN=t HAS_IMAGES=false \
@@ -253,7 +269,7 @@ conc_setup() { # schreibt $WORK/c-apply.sh und $WORK/c-full.sh gegen $SERVER/app
   : > "$WORK/fake.log"; : > "$WORK/events"; rm -f "$WORK/events.q" "$WORK/state" "$WORK/state.views"
   INPUT_DEPLOY_PATH="$SERVER/app" INPUT_APP_CONTAINER=app INPUT_PUBLIC_VOLUME_PATH="" GITHUB_SHA_VALUE="$SHA_VALUE" \
     "$EXTRACT" "$WF" quick-deploy "Apply + clear caches" --key script \
-    | sed -e "s|/tmp/quick-deploy|$WORK/qd|g" -e "s|/tmp/opcache-reset.out|$WORK/opcache.out|g" | nolock > "$WORK/c-apply.sh"
+    | sed -e "s|/tmp/quick-deploy-RUN-1|$WORK/qd|g" -e "s|/tmp/opcache-reset.out|$WORK/opcache.out|g" | nolock > "$WORK/c-apply.sh"
   INPUT_DEPLOY_PATH="$SERVER/app" INPUT_APP_CONTAINER=app GITHUB_SHA_VALUE="$SHA_VALUE" INPUT_STATEFUL_SERVICES="redis" INPUT_PRE_DEPLOY_COMMANDS="" INPUT_POST_DEPLOY_COMMANDS="" INPUT_EXTRA_DEPLOY_PATHS="" \
     "$EXTRACT" "$WF" full-deploy "Deploy to Hetzner" --key script | nolock > "$WORK/c-full.sh"
 }
@@ -355,6 +371,13 @@ for mode in fail readonly; do
 done
 fi
 grep -q 'mktemp -d' "$WORK/c-apply.sh" && ok "Rückmeldung der Sperre liegt in einem privaten mktemp -d Verzeichnis" || fail "kein mktemp -d"
+
+# Staging-Verzeichnis je Lauf und Repo getrennt, Aufräumen auch bei Fehler
+STG=$(ruby -ryaml -e 'wf=YAML.load_file(ARGV[0]); puts wf["jobs"]["quick-deploy"].dig("env","STAGING_DIR").to_s' "$WF")
+case "$STG" in *github.run_id*github.run_attempt*) ok "Staging-Verzeichnis enthält Lauf-ID und Versuch: $STG" ;; *) fail "Staging-Verzeichnis nicht je Lauf getrennt: '$STG'" ;; esac
+[ "$(grep -c '/tmp/quick-deploy[^-]' "$WF")" = "0" ] && ok "kein fester Pfad /tmp/quick-deploy mehr" || fail "fester Pfad /tmp/quick-deploy vorhanden"
+CLEAN_IF=$(ruby -ryaml -e 'wf=YAML.load_file(ARGV[0]); s=wf["jobs"]["quick-deploy"]["steps"].find{|x| x["name"].to_s.include?("Remove staging")}; puts s ? s["if"] : "fehlt"' "$WF")
+expect "Aufräumschritt für das Staging läuft immer (if: always())" "always()" "$CLEAN_IF"
 
 echo "== Build-Label"
 BUILD_LABEL=$(ruby -ryaml -e 'wf=YAML.load_file(ARGV[0]); s=wf["jobs"]["full-deploy"]["steps"].find{|x| x["name"]=="Build and push Docker image"}; puts s["with"]["labels"]' "$WF")

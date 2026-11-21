@@ -136,6 +136,20 @@ jobs:
           if ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
             full_deploy "Basis-Commit $BASE nicht abrufbar"
           fi
+          # Schutz gegen alte Wiederholungen: ist der zu deployende Commit ein Vorfahr des
+          # Basis-Vermerks (oder ein älterer Stand), würde ein Rerun einen neueren, bereits
+          # ausgerollten Stand überschreiben. Gilt für Quick UND Full (beide laufen erst nach
+          # diesem Schritt). Ist der Stand identisch (Wiederholung desselben Commits), läuft es normal.
+          if [ "$BASE" != "$(git rev-parse HEAD)" ]; then
+            git fetch --no-tags --unshallow origin 2>/dev/null || git fetch --no-tags origin 2>/dev/null || true
+            if git merge-base --is-ancestor HEAD "$BASE" 2>/dev/null; then ANC=0; else ANC=$?; fi
+            if [ "$ANC" -eq 0 ]; then
+              echo "::error::Abbruch: Commit $(git rev-parse HEAD) ist älter als der am Ziel ausgerollte Stand $BASE (Vermerk .quick-deploy-basis). Ein alter Lauf (Rerun) würde einen neueren Stand überschreiben. Nichts ausgerollt. Für einen bewussten Rückschritt den Vermerk am Ziel löschen oder einen neuen Revert-Commit pushen."
+              exit 1
+            elif [ "$ANC" -ne 1 ]; then
+              full_deploy "Vorfahren-Prüfung gegen Basis $BASE nicht möglich (Exit $ANC)"
+            fi
+          fi
           if ! CHANGED=$(git diff --name-only "$BASE" HEAD); then
             full_deploy "Diff gegen Basis $BASE fehlgeschlagen"
           fi
@@ -143,6 +157,15 @@ jobs:
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
           echo "Changed files since basis:"
           echo "$CHANGED"
+
+          # nginx.conf liegt am Server und wird dort von Hand gepflegt: weder Quick- noch
+          # Full-Deploy rollen sie aus. Der Lauf meldet das ehrlich, statt sie still als
+          # "quick ausgerollt" zu führen.
+          if echo "$CHANGED" | grep -qE '(^|/)nginx\.conf$'; then
+            MSG="nginx.conf hat sich geändert, wird aber NICHT ausgerollt (am Server von Hand gepflegt). Änderung dort selbst einspielen."
+            echo "::warning::$MSG"
+            [ -n "${GITHUB_STEP_SUMMARY:-}" ] && echo "**Hinweis:** $MSG" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
           # Full rebuild required for these file types
           FULL_PATTERN="^(Dockerfile|composer\.(json|lock)|package(-lock)?\.json|vite\.config\.[jt]s|tailwind\.config\.[jt]s|\.github/|app/|config/|database/|routes/|bootstrap/)"
@@ -169,6 +192,10 @@ jobs:
     needs: detect-changes
     if: needs.detect-changes.outputs.quick == 'true'
     runs-on: ${{ inputs.runner }}
+    env:
+      # Staging-Verzeichnis am Server je Lauf (Lauf-ID ist über alle Repos eindeutig): zwei
+      # gleichzeitige Quick-Deploys verschiedener Repos vertauschen keine Dateien mehr.
+      STAGING_DIR: /tmp/quick-deploy-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
 
@@ -232,14 +259,14 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           timeout: 30s
           command_timeout: 2m
-          script: mkdir -p /tmp/quick-deploy/resources/views /tmp/quick-deploy/lang /tmp/quick-deploy/public/build
+          script: mkdir -p ${{ env.STAGING_DIR }}/resources/views ${{ env.STAGING_DIR }}/lang ${{ env.STAGING_DIR }}/public/build
 
       - name: Upload views
         uses: burnett01/rsync-deployments@7.0.1
         with:
           switches: -az --delete
           path: resources/views/
-          remote_path: /tmp/quick-deploy/resources/views/
+          remote_path: ${{ env.STAGING_DIR }}/resources/views/
           remote_host: 46.224.6.69
           remote_user: root
           remote_key: ${{ secrets.SSH_PRIVATE_KEY }}
@@ -265,7 +292,7 @@ jobs:
         with:
           switches: -az --delete
           path: lang/
-          remote_path: /tmp/quick-deploy/lang/
+          remote_path: ${{ env.STAGING_DIR }}/lang/
           remote_host: 46.224.6.69
           remote_user: root
           remote_key: ${{ secrets.SSH_PRIVATE_KEY }}
@@ -275,7 +302,7 @@ jobs:
         with:
           switches: -az --delete
           path: public/build/
-          remote_path: /tmp/quick-deploy/public/build/
+          remote_path: ${{ env.STAGING_DIR }}/public/build/
           remote_host: 46.224.6.69
           remote_user: root
           remote_key: ${{ secrets.SSH_PRIVATE_KEY }}
@@ -300,7 +327,7 @@ jobs:
         with:
           switches: -az
           path: public/images/
-          remote_path: /tmp/quick-deploy/public/images/
+          remote_path: ${{ env.STAGING_DIR }}/public/images/
           remote_host: 46.224.6.69
           remote_user: root
           remote_key: ${{ secrets.SSH_PRIVATE_KEY }}
@@ -383,18 +410,18 @@ jobs:
               exit 1
             fi
 
-            docker cp /tmp/quick-deploy/resources/views/. "$CONTAINER":/var/www/resources/views/
-            if [ -d /tmp/quick-deploy/lang ]; then
-              docker cp /tmp/quick-deploy/lang/. "$CONTAINER":/var/www/lang/
+            docker cp ${{ env.STAGING_DIR }}/resources/views/. "$CONTAINER":/var/www/resources/views/
+            if [ -d ${{ env.STAGING_DIR }}/lang ]; then
+              docker cp ${{ env.STAGING_DIR }}/lang/. "$CONTAINER":/var/www/lang/
             fi
             if [ -n "$VOLUME" ]; then
-              cp -r /tmp/quick-deploy/public/build/. "$VOLUME/build/"
+              cp -r ${{ env.STAGING_DIR }}/public/build/. "$VOLUME/build/"
               # public/images/ — additive copy into the public volume so new
               # static images (e.g. /images/about/foo.jpg) reach nginx without
               # a full Docker rebuild. www-data inside the container is uid 82.
-              if [ "$HAS_IMAGES" = "true" ] && [ -d /tmp/quick-deploy/public/images ]; then
+              if [ "$HAS_IMAGES" = "true" ] && [ -d ${{ env.STAGING_DIR }}/public/images ]; then
                 mkdir -p "$VOLUME/images"
-                cp -r /tmp/quick-deploy/public/images/. "$VOLUME/images/"
+                cp -r ${{ env.STAGING_DIR }}/public/images/. "$VOLUME/images/"
                 chown -R 82:82 "$VOLUME/images"
                 find "$VOLUME/images" -type d -exec chmod 755 {} \;
                 find "$VOLUME/images" -type f -exec chmod 644 {} \;
@@ -441,7 +468,7 @@ jobs:
               fi
             fi
 
-            rm -rf /tmp/quick-deploy
+            rm -rf "${{ env.STAGING_DIR }}"
 
             # Basis-Vermerk erst jetzt, nach vollständig erfolgreichem Ausrollen (set -e):
             # der nächste Quick-Deploy diffte gegen diesen Stand. Ohne geglückten
@@ -462,6 +489,19 @@ jobs:
               fi
             fi
             echo "Quick deploy done (Basis ${{ github.sha }})"
+
+      # Staging-Verzeichnis dieses Laufs auch bei Fehler oder Abbruch entfernen
+      # (sonst bleibt es in /tmp am Server liegen).
+      - name: Remove staging dir on server
+        if: always()
+        uses: appleboy/ssh-action@v1.2.5
+        with:
+          host: 46.224.6.69
+          username: root
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          timeout: 30s
+          command_timeout: 1m
+          script: rm -rf "${{ env.STAGING_DIR }}"
 
   # ── Full Deploy: Docker build + push + restart ───────────────────────────────
   full-deploy:
