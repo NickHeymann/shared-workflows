@@ -332,6 +332,30 @@ expect "vertauschte Haupt-/Extra-Pfade: beide Läufe enden mit Exit 0 (keine Ver
 OVERLAP=$(awk '/-start/{d++; if(d>1) bad=1} /-end/{d--} END{print bad?"ueberlappt":"getrennt"}' "$WORK/events")
 expect "vertauschte Haupt-/Extra-Pfade: Läufe überlappen nicht" "getrennt" "$OVERLAP"
 
+# Fehler beim Rückmelde-Verzeichnis der Sperre: laut scheitern, nie hängen, nie ohne Sperre weiterlaufen
+BIN2="$WORK/bin2"; mkdir -p "$BIN2"
+cat > "$BIN2/mktemp" <<'FAKE'
+#!/bin/bash
+case "${FAKE_MKTEMP:-}" in
+  fail) exit 1 ;;
+  readonly) d="${FAKE_MKTEMP_DIR}"; mkdir -p "$d"; chmod 500 "$d"; echo "$d" ;;
+  *) exec /usr/bin/mktemp "$@" ;;
+esac
+FAKE
+chmod +x "$BIN2/mktemp"
+if [ -z "${TEST_NOLOCK:-}" ]; then
+for mode in fail readonly; do
+  conc_setup
+  START=$(date +%s)
+  PATH="$BIN2:$PATH" FAKE_MKTEMP="$mode" FAKE_MKTEMP_DIR="$WORK/ro-$mode" conc_env EXPECTED_BASE="$C1" OPCACHE_RESET_URL=x DEPLOY_TOKEN=t HAS_IMAGES=false bash -e "$WORK/c-apply.sh" > "$WORK/c-apply.out" 2>&1; RC=$?
+  chmod 700 "$WORK/ro-$mode" 2>/dev/null
+  [ "$RC" -ne 0 ] && grep -qE 'Deploy-Sperre|mktemp' "$WORK/c-apply.out" && ok "Quick: Sperr-Rückmeldung '$mode' -> laute Fehlermeldung, kein Weiterlaufen ohne Sperre" || fail "Quick: Sperr-Rückmeldung '$mode' wird nicht abgefangen (Exit $RC)"
+  [ $(( $(date +%s) - START )) -lt 60 ] && ok "Quick: '$mode' hängt nicht" || fail "Quick: '$mode' hängt"
+  expect "Quick: '$mode' -> nichts ausgerollt" "0" "$(grep -c '^docker cp' "$WORK/fake.log")"
+done
+fi
+grep -q 'mktemp -d' "$WORK/c-apply.sh" && ok "Rückmeldung der Sperre liegt in einem privaten mktemp -d Verzeichnis" || fail "kein mktemp -d"
+
 echo "== Build-Label"
 BUILD_LABEL=$(ruby -ryaml -e 'wf=YAML.load_file(ARGV[0]); s=wf["jobs"]["full-deploy"]["steps"].find{|x| x["name"]=="Build and push Docker image"}; puts s["with"]["labels"]' "$WF")
 expect "Build setzt das Revision-Label" "org.opencontainers.image.revision=\${{ github.sha }}" "$(printf '%s' "$BUILD_LABEL" | head -n 1)"

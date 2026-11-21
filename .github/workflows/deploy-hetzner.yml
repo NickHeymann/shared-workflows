@@ -335,19 +335,31 @@ jobs:
             # Skripts (auch nicht aus pre-/post-deploy-commands) die Sperre. Ein zweiter Lauf
             # wartet mit Frist und scheitert danach laut.
             acquire_deploy_lock() { # pfad frist-in-sekunden
-              local lp="$1" wait_s="$2" ok holder
-              ok=$(mktemp)
-              rm -f "$ok"
-              flock -w "$wait_s" "$lp/.deploy.lock" sh -c 'echo gesperrt > "$1"; while kill -0 "$2" 2>/dev/null; do sleep 1; done' sh "$ok" "$$" >/dev/null 2>&1 &
+              local lp="$1" wait_s="$2" ok_dir ok holder ticks=0 max_ticks
+              # Rückmeldung des Hilfsprozesses in einem privaten Verzeichnis (0700), das
+              # bestehen bleibt, bis die Sperre erhalten ist: kein vorgetäuschtes "gesperrt".
+              ok_dir=$(mktemp -d) || { echo "::error::mktemp fehlgeschlagen, Deploy-Sperre nicht möglich. Nichts ausgerollt."; return 1; }
+              ok="$ok_dir/gesperrt"
+              flock -w "$wait_s" "$lp/.deploy.lock" sh -c 'echo gesperrt > "$1" || exit 1; while kill -0 "$2" 2>/dev/null; do sleep 1; done' sh "$ok" "$$" >/dev/null 2>&1 &
               holder=$!
+              # Wartezeit begrenzt: Sperrfrist plus 30 Sekunden Reserve (5 Prüfungen je Sekunde)
+              max_ticks=$(( (wait_s + 30) * 5 ))
               while [ ! -s "$ok" ]; do
                 if ! kill -0 "$holder" 2>/dev/null && [ ! -s "$ok" ]; then
+                  rmdir "$ok_dir" 2>/dev/null
                   echo "::error::Deploy-Sperre $lp/.deploy.lock nach $wait_s Sekunden nicht erhalten (anderer Deploy läuft noch). Nichts ausgerollt."
+                  return 1
+                fi
+                ticks=$((ticks + 1))
+                if [ "$ticks" -ge "$max_ticks" ]; then
+                  kill "$holder" 2>/dev/null
+                  rm -f "$ok"; rmdir "$ok_dir" 2>/dev/null
+                  echo "::error::Deploy-Sperre $lp/.deploy.lock: keine Rückmeldung des Sperr-Hilfsprozesses innerhalb der Frist. Nichts ausgerollt."
                   return 1
                 fi
                 sleep 0.2
               done
-              rm -f "$ok"
+              rm -f "$ok"; rmdir "$ok_dir"
             }
             if ! acquire_deploy_lock "${{ inputs.deploy-path }}" 120; then
               exit 1
@@ -691,19 +703,31 @@ jobs:
             # Skripts (auch nicht aus pre-/post-deploy-commands) die Sperre. Ein zweiter Lauf
             # wartet mit Frist und scheitert danach laut.
             acquire_deploy_lock() { # pfad frist-in-sekunden
-              local lp="$1" wait_s="$2" ok holder
-              ok=$(mktemp)
-              rm -f "$ok"
-              flock -w "$wait_s" "$lp/.deploy.lock" sh -c 'echo gesperrt > "$1"; while kill -0 "$2" 2>/dev/null; do sleep 1; done' sh "$ok" "$$" >/dev/null 2>&1 &
+              local lp="$1" wait_s="$2" ok_dir ok holder ticks=0 max_ticks
+              # Rückmeldung des Hilfsprozesses in einem privaten Verzeichnis (0700), das
+              # bestehen bleibt, bis die Sperre erhalten ist: kein vorgetäuschtes "gesperrt".
+              ok_dir=$(mktemp -d) || { echo "::error::mktemp fehlgeschlagen, Deploy-Sperre nicht möglich. Nichts ausgerollt."; return 1; }
+              ok="$ok_dir/gesperrt"
+              flock -w "$wait_s" "$lp/.deploy.lock" sh -c 'echo gesperrt > "$1" || exit 1; while kill -0 "$2" 2>/dev/null; do sleep 1; done' sh "$ok" "$$" >/dev/null 2>&1 &
               holder=$!
+              # Wartezeit begrenzt: Sperrfrist plus 30 Sekunden Reserve (5 Prüfungen je Sekunde)
+              max_ticks=$(( (wait_s + 30) * 5 ))
               while [ ! -s "$ok" ]; do
                 if ! kill -0 "$holder" 2>/dev/null && [ ! -s "$ok" ]; then
+                  rmdir "$ok_dir" 2>/dev/null
                   echo "::error::Deploy-Sperre $lp/.deploy.lock nach $wait_s Sekunden nicht erhalten (anderer Deploy läuft noch). Nichts ausgerollt."
+                  return 1
+                fi
+                ticks=$((ticks + 1))
+                if [ "$ticks" -ge "$max_ticks" ]; then
+                  kill "$holder" 2>/dev/null
+                  rm -f "$ok"; rmdir "$ok_dir" 2>/dev/null
+                  echo "::error::Deploy-Sperre $lp/.deploy.lock: keine Rückmeldung des Sperr-Hilfsprozesses innerhalb der Frist. Nichts ausgerollt."
                   return 1
                 fi
                 sleep 0.2
               done
-              rm -f "$ok"
+              rm -f "$ok"; rmdir "$ok_dir"
             }
 
             cd "${{ inputs.deploy-path }}"
