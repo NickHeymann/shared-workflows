@@ -389,7 +389,7 @@ grep -q 'mktemp -d' "$WORK/c-apply.sh" && ok "Rückmeldung der Sperre liegt in e
 
 # Staging-Verzeichnis je Lauf und Repo getrennt, Aufräumen auch bei Fehler
 STG=$(ruby -ryaml -e 'wf=YAML.load_file(ARGV[0]); puts wf["jobs"]["quick-deploy"].dig("env","STAGING_DIR").to_s' "$WF")
-case "$STG" in *needs.detect-changes.outputs.stage*) ok "Staging-Verzeichnis kommt aus dem Namensschritt je Aufruf: $STG" ;; *) fail "Staging-Verzeichnis nicht je Lauf getrennt: '$STG'" ;; esac
+case "$STG" in *needs.detect-changes.outputs.stage*github.run_attempt*) ok "Staging-Verzeichnis kommt aus dem Namensschritt je Aufruf plus aktuellem Versuch: $STG" ;; *) fail "Staging-Verzeichnis nicht je Lauf getrennt: '$STG'" ;; esac
 [ "$(grep -c '/tmp/quick-deploy[^-]' "$WF")" = "0" ] && ok "kein fester Pfad /tmp/quick-deploy mehr" || fail "fester Pfad /tmp/quick-deploy vorhanden"
 CLEAN_IF=$(ruby -ryaml -e 'wf=YAML.load_file(ARGV[0]); s=wf["jobs"]["quick-deploy"]["steps"].find{|x| x["name"].to_s.include?("Remove staging")}; puts s ? s["if"] : "fehlt"' "$WF")
 expect "Aufräumschritt für das Staging läuft immer (if: always())" "always()" "$CLEAN_IF"

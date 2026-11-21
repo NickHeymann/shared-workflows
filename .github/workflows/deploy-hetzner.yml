@@ -208,9 +208,10 @@ jobs:
     if: needs.detect-changes.outputs.quick == 'true'
     runs-on: ${{ inputs.runner }}
     env:
-      # Staging-Verzeichnis am Server je Aufruf (Lauf-ID, Versuch und Zufallsanteil aus
-      # detect-changes): gleichzeitige Quick-Deploys vertauschen keine Dateien.
-      STAGING_DIR: /tmp/${{ needs.detect-changes.outputs.stage }}
+      # Staging-Verzeichnis am Server je Aufruf (Lauf-ID und Zufallsanteil aus detect-changes)
+      # UND je Versuch dieses Jobs: bei "Re-run failed jobs" bleibt der Output von detect-changes
+      # erhalten, die aktuelle run_attempt hält den neuen Versuch vom alten getrennt.
+      STAGING_DIR: /tmp/${{ needs.detect-changes.outputs.stage }}-a${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
 
