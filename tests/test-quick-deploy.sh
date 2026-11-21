@@ -181,8 +181,12 @@ cat > "$BIN/flock" <<'FAKE'
 #!/usr/bin/env python3
 # Attrappe fuer util-linux flock ("flock [-w SEK] FD" und "flock [-w SEK] DATEI BEFEHL..."), weil macOS kein flock hat.
 import fcntl, os, subprocess, sys, time
-a = sys.argv[1:]; w = None
-if a and a[0] == "-w": w = float(a[1]); a = a[2:]
+a = sys.argv[1:]; w = None; mode = fcntl.LOCK_EX
+while a and a[0] in ("-w", "-s", "-x", "-n"):
+    if a[0] == "-w": w = float(a[1]); a = a[2:]
+    elif a[0] == "-s": mode = fcntl.LOCK_SH; a = a[1:]
+    elif a[0] == "-x": mode = fcntl.LOCK_EX; a = a[1:]
+    else: w = 0; a = a[1:]
 if a[0].isdigit():
     fd = int(a[0]); cmd = None
 else:
@@ -190,7 +194,7 @@ else:
 end = time.time() + (w if w is not None else 1e9)
 while True:
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, mode | fcntl.LOCK_NB)
         sys.exit(subprocess.call(cmd, close_fds=True) if cmd else 0)
     except OSError:
         if time.time() >= end: sys.exit(1)
@@ -199,6 +203,9 @@ FAKE
 chmod +x "$BIN"/*
 # Rotprobe-Schalter: TEST_NOLOCK=1 entfernt die Sperre aus den Skripten
 nolock() { if [ -n "${TEST_NOLOCK:-}" ]; then sed -E 's/flock -w "\$wait_s" "\$lp\/.deploy.lock" //'; else cat; fi; }
+# Rotprobe-Schalter: TEST_NODOCKERLOCK=1 entfernt die hostweite Docker-Sperre aus dem Deploy
+nodockerlock() { if [ -n "${TEST_NODOCKERLOCK:-}" ]; then sed -E 's/flock "-\$mode" -w "\$wait_s" "\$DOCKER_LOCK_FILE" //'; else cat; fi; }
+export DOCKER_LOCK_FILE="$WORK/docker-image.lock"
 shortwait() { sed -E 's/(acquire_deploy_lock "[^"]*") [0-9]+/\1 1/'; }
 
 SHA_VALUE="$C4"
@@ -210,7 +217,7 @@ run_quick() { # fail usr2fail curlcode vorhandener-vermerk -> schreibt $SERVER/a
   : > "$WORK/fake.log"
   INPUT_DEPLOY_PATH="$SERVER/app" INPUT_APP_CONTAINER=app INPUT_PUBLIC_VOLUME_PATH="" GITHUB_SHA_VALUE="$SHA_VALUE" \
     "$EXTRACT" "$WF" quick-deploy "Apply + clear caches" --key script \
-    | sed -e "s|/tmp/quick-deploy-RUN-1|$WORK/qd|g" -e "s|/tmp/opcache-reset.out|$WORK/opcache.out|g" | nolock > "$WORK/apply.sh"
+    | sed -e "s|/tmp/quick-deploy-RUN-1|$WORK/qd|g" -e "s|/tmp/opcache-reset.out|$WORK/opcache.out|g" | nolock | nodockerlock > "$WORK/apply.sh"
   PATH="$BIN:$PATH" FAKE_LOG="$WORK/fake.log" MARKER="$SERVER/app/.quick-deploy-basis" FAKE_FAIL="$1" FAKE_USR2_FAIL="$2" FAKE_CURL_CODE="$3" \
     FAKE_CONCURRENT="${QUICK_CONCURRENT:-}" EXPECTED_BASE="${QUICK_EXPECTED-$4}" \
     OPCACHE_RESET_URL="https://x.invalid/reset" DEPLOY_TOKEN=t HAS_IMAGES=false \
@@ -248,7 +255,7 @@ run_full() { # fail label app-container vorhandener-vermerk  (FULL_EXTRA: Extra-
   [ -n "${FULL_EXTRA:-}" ] && echo "$C1" > "$SERVER/staging/.quick-deploy-basis"
   : > "$WORK/fake.log"
   INPUT_DEPLOY_PATH="$SERVER/app" INPUT_APP_CONTAINER="$3" GITHUB_SHA_VALUE="$SHA_VALUE" INPUT_STATEFUL_SERVICES="redis" INPUT_PRE_DEPLOY_COMMANDS="" INPUT_POST_DEPLOY_COMMANDS="" INPUT_EXTRA_DEPLOY_PATHS="${FULL_EXTRA:+$SERVER/staging}" \
-    "$EXTRACT" "$WF" full-deploy "Deploy to Hetzner" --key script | nolock > "$WORK/full.sh"
+    "$EXTRACT" "$WF" full-deploy "Deploy to Hetzner" --key script | nolock | nodockerlock > "$WORK/full.sh"
   PATH="$BIN:$PATH" FAKE_LOG="$WORK/fake.log" MARKER="$SERVER/app/.quick-deploy-basis" FAKE_FAIL="$1" FAKE_LABEL="$2" GHCR_TOKEN=x EXPECTED_BASE="${EXP_OVERRIDE-$4}" \
     bash "$WORK/full.sh" > "$WORK/full.out" 2>&1
 }
@@ -291,9 +298,9 @@ conc_setup() { # schreibt $WORK/c-apply.sh und $WORK/c-full.sh gegen $SERVER/app
   : > "$WORK/fake.log"; : > "$WORK/events"; rm -f "$WORK/events.q" "$WORK/state" "$WORK/state.views"
   INPUT_DEPLOY_PATH="$SERVER/app" INPUT_APP_CONTAINER=app INPUT_PUBLIC_VOLUME_PATH="" GITHUB_SHA_VALUE="$SHA_VALUE" \
     "$EXTRACT" "$WF" quick-deploy "Apply + clear caches" --key script \
-    | sed -e "s|/tmp/quick-deploy-RUN-1|$WORK/qd|g" -e "s|/tmp/opcache-reset.out|$WORK/opcache.out|g" | nolock > "$WORK/c-apply.sh"
+    | sed -e "s|/tmp/quick-deploy-RUN-1|$WORK/qd|g" -e "s|/tmp/opcache-reset.out|$WORK/opcache.out|g" | nolock | nodockerlock > "$WORK/c-apply.sh"
   INPUT_DEPLOY_PATH="$SERVER/app" INPUT_APP_CONTAINER=app GITHUB_SHA_VALUE="$SHA_VALUE" INPUT_STATEFUL_SERVICES="redis" INPUT_PRE_DEPLOY_COMMANDS="" INPUT_POST_DEPLOY_COMMANDS="" INPUT_EXTRA_DEPLOY_PATHS="" \
-    "$EXTRACT" "$WF" full-deploy "Deploy to Hetzner" --key script | nolock > "$WORK/c-full.sh"
+    "$EXTRACT" "$WF" full-deploy "Deploy to Hetzner" --key script | nolock | nodockerlock > "$WORK/c-full.sh"
 }
 conc_env() { PATH="$BIN:$PATH" FAKE_LOG="$WORK/fake.log" MARKER="$SERVER/app/.quick-deploy-basis" FAKE_EVENTS="$WORK/events" FAKE_STATE="$WORK/state" FAKE_SLEEP=1 FAKE_LABEL="$OTHER" EXPECTED_BASE="$C1" env "$@"; }
 conc_setup
@@ -335,7 +342,7 @@ wait "$PID_H" 2>/dev/null
 # Sperr-Deskriptoren werden nicht an Hintergrundprozesse aus pre-deploy-commands vererbt
 genfull() { # main extra pre -> $WORK/g-full.sh
   INPUT_DEPLOY_PATH="$1" INPUT_APP_CONTAINER=app GITHUB_SHA_VALUE="$SHA_VALUE" INPUT_STATEFUL_SERVICES="redis" INPUT_PRE_DEPLOY_COMMANDS="$3" INPUT_POST_DEPLOY_COMMANDS="$3" INPUT_EXTRA_DEPLOY_PATHS="$2" \
-    "$EXTRACT" "$WF" full-deploy "Deploy to Hetzner" --key script | nolock > "$4"
+    "$EXTRACT" "$WF" full-deploy "Deploy to Hetzner" --key script | nolock | nodockerlock > "$4"
 }
 conc_setup
 genfull "$SERVER/app" "" "sleep 6 &" "$WORK/g-full.sh"
@@ -425,6 +432,67 @@ FAKE_PULL_FAILS=1 FAKE_PULL_LONG=1 PULL_RETRY_WAIT=0 run_full "" "$C4" app "$C1"
 expect "Pull: Fehler steht VOR 600 kB Ausgabe (SIGPIPE-Fall) -> trotzdem Wiederholung, Exit 0" "0" "$RC"
 expect "Pull: ... zwei Versuche" "2" "$(grep -c '^docker compose pull' "$WORK/fake.log")"
 rm -f "$WORK/fake.log.pulln"
+
+echo "== Hostweite Docker-Sperre (Prune gegen Pull)"
+dl_setup() { # schreibt $WORK/d-full.sh (Full-Deploy) gegen $SERVER/app, leert Ereignisse
+  conc_setup; rm -f "$DOCKER_LOCK_FILE" "$WORK/events.s"
+  genfull "$SERVER/app" "" "" "$WORK/d-full.sh"
+}
+# Attrappe eines Prune-Skripts auf dem Server: Prune nur unter exklusiver Sperre, Ereignisse mit Zeitmarke
+pruner() { # frist-sek dauer-sek -> Exit 0 = gelaufen, 1 = übersprungen
+  PATH="$BIN:$PATH" flock -x -w "$1" "$DOCKER_LOCK_FILE" sh -c "echo prune-start >> '$WORK/events'; sleep $2; echo prune-end >> '$WORK/events'"
+}
+# 1) Prune läuft zuerst: der Deploy darf seinen Pull erst nach dem Ende des Prunes beginnen
+dl_setup
+( pruner 30 3; echo $? > "$WORK/p.rc" ) &
+PID_P=$!
+sleep 0.6
+conc_env GHCR_TOKEN=x bash "$WORK/d-full.sh" > "$WORK/d-full.out" 2>&1; RC=$?
+wait "$PID_P"
+expect "Prune zuerst: Deploy wartet, bis der Prune fertig ist (Reihenfolge der Ereignisse)" "prune-start prune-end full-start" "$(grep -E 'prune-start|prune-end|full-start' "$WORK/events" | tr '\n' ' ' | sed 's/ $//')"
+expect "Prune zuerst: Deploy gelingt danach (Exit 0)" "0" "$RC"
+# 2) Deploy zieht gerade: ein Prune muss warten und wird nach Frist übersprungen
+dl_setup
+( FAKE_SLEEP=4 conc_env GHCR_TOKEN=x bash "$WORK/d-full.sh" > "$WORK/d-full.out" 2>&1; echo $? > "$WORK/d.rc" ) &
+PID_D=$!
+sleep 1.2
+pruner 1 1; PRC=$?
+wait "$PID_D"
+expect "Deploy zieht: gleichzeitiger Prune wird nach Frist übersprungen (Exit 1, lief nicht)" "1" "$PRC"
+expect "Deploy zieht: im Ereignisprotokoll steht kein Prune" "0" "$(grep -c 'prune-start' "$WORK/events")"
+expect "Deploy zieht: Deploy selbst gelingt (Exit 0)" "0" "$(cat "$WORK/d.rc")"
+# 3) Nach dem Deploy ist die Sperre frei: ein Prune läuft sofort
+pruner 2 0; expect "Nach dem Deploy: Sperre frei, Prune läuft" "0" "$?"
+# 4) Anderer Deploy hält die Sperre geteilt: das Aufräumen am Ende wird übersprungen, der Deploy bleibt grün
+dl_setup
+( exec 9>"$DOCKER_LOCK_FILE"; PATH="$BIN:$PATH" flock -s 9; sleep 10 ) &
+PID_S=$!
+sleep 0.5
+sed -E 's/docker_lock x 60/docker_lock x 1/' "$WORK/d-full.sh" > "$WORK/d-full-kurz.sh"
+conc_env GHCR_TOKEN=x bash "$WORK/d-full-kurz.sh" > "$WORK/d-full.out" 2>&1; RC=$?
+if [ -n "${TEST_NODOCKERLOCK:-}" ]; then fail "Aufräumen unter fremder geteilter Sperre (ohne Sperre nicht prüfbar)"; else
+expect "Fremde geteilte Sperre: Deploy bleibt grün (Exit 0)" "0" "$RC"
+grep -q 'Aufräumen übersprungen' "$WORK/d-full.out" && ok "Fremde geteilte Sperre: laute Meldung, Aufräumen übersprungen" || fail "Fremde geteilte Sperre: keine Meldung"
+expect "Fremde geteilte Sperre: kein docker image prune" "0" "$(grep -c '^docker image prune' "$WORK/fake.log")"
+fi
+wait "$PID_S" 2>/dev/null
+# 5) Ohne fremden Halter räumt der Deploy selbst auf (unter exklusiver Sperre)
+dl_setup
+conc_env GHCR_TOKEN=x bash "$WORK/d-full.sh" > "$WORK/d-full.out" 2>&1; RC=$?
+expect "Aufräumen am Ende läuft, wenn die Sperre frei ist" "1" "$(grep -c '^docker image prune' "$WORK/fake.log")"
+expect "Deploy gibt die Sperre am Ende frei (Prune sofort möglich)" "0" "$(pruner 2 0; echo $?)"
+# 6) Prune hält die Sperre länger als die Frist des Deploys: Deploy bricht laut ab, nichts ausgerollt
+dl_setup
+sed -E 's/docker_lock s 300/docker_lock s 1/' "$WORK/d-full.sh" > "$WORK/d-full-kurz.sh"
+( pruner 30 4 ) &
+PID_P=$!
+sleep 0.6
+conc_env GHCR_TOKEN=x bash "$WORK/d-full-kurz.sh" > "$WORK/d-full.out" 2>&1; RC=$?
+wait "$PID_P"
+if [ -n "${TEST_NODOCKERLOCK:-}" ]; then fail "Deploy-Frist gegen langen Prune (ohne Sperre nicht prüfbar)"; else
+[ "$RC" -ne 0 ] && grep -q 'Docker-Sperre (geteilt) nicht erhalten' "$WORK/d-full.out" && ok "Langer Prune: Deploy bricht laut ab (Exit $RC)" || fail "Langer Prune: Deploy ohne lauten Abbruch (Exit $RC)"
+expect "Langer Prune: nichts ausgerollt (kein compose pull)" "0" "$(grep -c 'compose pull' "$WORK/fake.log")"
+fi
 
 echo "== Build-Label"
 BUILD_LABEL=$(ruby -ryaml -e 'wf=YAML.load_file(ARGV[0]); s=wf["jobs"]["full-deploy"]["steps"].find{|x| x["name"]=="Build and push Docker image"}; puts s["with"]["labels"]' "$WF")
