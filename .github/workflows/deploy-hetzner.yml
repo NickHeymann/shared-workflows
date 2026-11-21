@@ -322,6 +322,12 @@ jobs:
             set -e
             CONTAINER="${{ inputs.app-container }}"
             VOLUME="${{ inputs.public-volume-path }}"
+            BASIS_FILE="${{ inputs.deploy-path }}/.quick-deploy-basis"
+
+            # Basis-Vermerk ungültig machen, BEVOR das Ziel verändert wird: bricht dieser
+            # Lauf ab (cancel, Fehler), gilt kein veralteter Vermerk weiter, und der nächste
+            # Deploy fällt auf Full-Deploy zurück.
+            rm -f "$BASIS_FILE" "$BASIS_FILE.tmp"
 
             docker cp /tmp/quick-deploy/resources/views/. "$CONTAINER":/var/www/resources/views/
             if [ -d /tmp/quick-deploy/lang ]; then
@@ -358,6 +364,7 @@ jobs:
             # opcache_reset() im FPM-Worker-Kontext aufruft (CLI-opcache_reset wirkt
             # nicht auf FPM). kill -USR2 bleibt als Fallback, wenn keine URL gesetzt.
             RESET_OK=0
+            RESET_FAILED=0
             if [ -n "$OPCACHE_RESET_URL" ] && [ -n "$DEPLOY_TOKEN" ]; then
               # Token per Header (nicht als Query-String → landet nicht in
               # nginx-/Proxy-Access-Logs). -H via env, nicht ins URL interpoliert.
@@ -374,17 +381,24 @@ jobs:
             fi
             if [ "$RESET_OK" = "0" ]; then
               echo "Fallback: kill -USR2 an FPM-Master"
-              docker exec --user root "$CONTAINER" kill -USR2 1 \
-                || echo "WARN: USR2 failed; consider docker compose restart"
+              if ! docker exec --user root "$CONTAINER" kill -USR2 1; then
+                RESET_FAILED=1
+                echo "WARN: USR2 failed; consider docker compose restart"
+              fi
             fi
 
             rm -rf /tmp/quick-deploy
 
-            # Basis-Vermerk erst jetzt, nach erfolgreichem Ausrollen (set -e): der nächste
-            # Quick-Deploy diffte gegen diesen Stand. Atomar über .tmp + mv.
-            BASIS_FILE="${{ inputs.deploy-path }}/.quick-deploy-basis"
-            printf '%s\n' "${{ github.sha }}" > "$BASIS_FILE.tmp"
-            mv "$BASIS_FILE.tmp" "$BASIS_FILE"
+            # Basis-Vermerk erst jetzt, nach vollständig erfolgreichem Ausrollen (set -e):
+            # der nächste Quick-Deploy diffte gegen diesen Stand. Ohne geglückten
+            # OPcache-Reset gilt der Stand nicht als ausgerollt (kein Vermerk, nächster
+            # Deploy ist ein Full-Deploy). Atomar über .tmp + mv.
+            if [ "$RESET_FAILED" = "1" ]; then
+              echo "WARN: Basis-Vermerk nicht geschrieben (OPcache-Reset fehlgeschlagen), nächster Deploy ist ein Full-Deploy"
+            else
+              printf '%s\n' "${{ github.sha }}" > "$BASIS_FILE.tmp"
+              mv "$BASIS_FILE.tmp" "$BASIS_FILE"
+            fi
             echo "Quick deploy done (Basis ${{ github.sha }})"
 
   # ── Full Deploy: Docker build + push + restart ───────────────────────────────
@@ -544,6 +558,11 @@ jobs:
           tags: |
             ghcr.io/${{ inputs.image-name }}:latest
             ghcr.io/${{ inputs.image-name }}:${{ github.sha }}
+          # Revision im Image: der Basis-Vermerk nach dem Deploy wird aus diesem Label des
+          # tatsächlich gestarteten Containers gelesen, nicht aus github.sha (sonst könnte
+          # ein :latest eines anderen, abgebrochenen Laufs unter fremdem SHA verbucht werden).
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
           # No cache-from/to: the persistent docker-container builder above keeps
           # its full layer cache + RUN --mount=type=cache caches in its local
           # state volume between jobs. That is strictly faster than the previous
@@ -615,6 +634,14 @@ jobs:
             }
 
             cd "${{ inputs.deploy-path }}"
+
+            # Basis-Vermerk ungültig machen, BEVOR das Ziel verändert wird (nur bei Repos
+            # mit Quick-Deploy). Er wird erst nach vollständigem Erfolg neu geschrieben;
+            # bricht der Deploy dazwischen ab, fällt der nächste Lauf auf Full-Deploy zurück.
+            if [ -n "${{ inputs.app-container }}" ]; then
+              rm -f "${{ inputs.deploy-path }}/.quick-deploy-basis" "${{ inputs.deploy-path }}/.quick-deploy-basis.tmp"
+            fi
+
             docker compose pull
 
             # Pre-deploy commands (e.g. migrations before up)
@@ -641,12 +668,21 @@ jobs:
 
             # Basis-Vermerk erst nach erfolgreichem Ausrollen (set -euo pipefail, alle
             # Pfade): der nächste Quick-Deploy diffte gegen diesen Stand und fällt auf
-            # Full-Deploy zurück, wenn er fehlt. Atomar über .tmp + mv. Nur bei
-            # Repos mit Quick-Deploy (app-container), alle anderen bleiben unberührt.
+            # Full-Deploy zurück, wenn er fehlt. Der Wert ist die Revision aus dem Label
+            # des laufenden App-Containers (an das tatsächlich gestartete Image gebunden),
+            # nicht github.sha; fehlt oder ungültig, bleibt der Vermerk weg (fail closed).
+            # Atomar über .tmp + mv. Nur bei Repos mit Quick-Deploy (app-container).
             if [ -n "${{ inputs.app-container }}" ]; then
-              cd "${{ inputs.deploy-path }}"
-              printf '%s\n' "${{ github.sha }}" > .quick-deploy-basis.tmp
-              mv .quick-deploy-basis.tmp .quick-deploy-basis
+              if ! REVISION=$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "${{ inputs.app-container }}"); then
+                REVISION=""
+              fi
+              if printf '%s' "$REVISION" | grep -qE '^[0-9a-f]{40}$'; then
+                printf '%s\n' "$REVISION" > "${{ inputs.deploy-path }}/.quick-deploy-basis.tmp"
+                mv "${{ inputs.deploy-path }}/.quick-deploy-basis.tmp" "${{ inputs.deploy-path }}/.quick-deploy-basis"
+                echo "Basis-Vermerk: $REVISION"
+              else
+                echo "::warning::Image-Revision des Containers ${{ inputs.app-container }} nicht lesbar, kein Basis-Vermerk (nächster Deploy ist ein Full-Deploy)"
+              fi
             fi
 
             # Cleanup old images (skip recently used to avoid race with concurrent deploys)

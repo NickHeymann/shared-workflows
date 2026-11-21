@@ -24,7 +24,7 @@ expect() { # name expected actual
 # ── Attrappen-Repo ────────────────────────────────────────────────────────────
 ORIGIN="$WORK/origin.git"
 SRC="$WORK/src"
-git init -q --bare "$ORIGIN"
+git init -q --bare -b main "$ORIGIN"
 git -C "$ORIGIN" config uploadpack.allowReachableSHA1InWant true
 git init -q -b main "$SRC"
 git -C "$SRC" config user.email t@example.invalid
@@ -107,49 +107,102 @@ expect "public/images fehlt -> exists=false (kein rsync-Abbruch)" "exists=false"
 UPLOAD_IF=$(ruby -ryaml -e 'wf=YAML.load_file(ARGV[0]); s=wf["jobs"]["quick-deploy"]["steps"].find{|x| x["name"]=="Upload public images"}; puts s && s["if"]' "$WF")
 expect "Upload public images ist an has-images gebunden" "steps.has-images.outputs.exists == 'true'" "$UPLOAD_IF"
 
-echo "== Server-Skripte (Basis-Vermerk schreiben)"
-SERVER="$WORK/server"; mkdir -p "$SERVER/app"
-SHA_VALUE="$C4"
-# Quick-Deploy: nur der Teil ab BASIS_FILE= (der Rest braucht docker)
-INPUT_DEPLOY_PATH="$SERVER/app" GITHUB_SHA_VALUE="$SHA_VALUE" "$EXTRACT" "$WF" quick-deploy "Apply + clear caches" --key script > "$WORK/apply.sh" || fail "Extraktion Apply-Skript"
-if grep -q 'BASIS_FILE=' "$WORK/apply.sh"; then
-  sed -n '/BASIS_FILE=/,$p' "$WORK/apply.sh" > "$WORK/apply-tail.sh"
-  (bash -e "$WORK/apply-tail.sh" >/dev/null 2>&1)
-  expect "Quick-Deploy schreibt Basis-Vermerk" "$C4" "$(cat "$SERVER/app/.quick-deploy-basis" 2>/dev/null)"
-  [ ! -e "$SERVER/app/.quick-deploy-basis.tmp" ] && ok "Quick-Deploy: keine .tmp-Datei übrig" || fail "Quick-Deploy: .tmp-Datei übrig"
-else
-  fail "Quick-Deploy-Skript enthaelt keinen Basis-Vermerk"
+echo "== Server-Skripte (Basis-Vermerk), echte Skripte gegen Attrappen von docker, curl, timeout"
+BIN="$WORK/bin"; mkdir -p "$BIN"
+cat > "$BIN/docker" <<'FAKE'
+#!/bin/bash
+# Attrappe: protokolliert Aufrufe, prueft den Vermerk zum Zeitpunkt der Aufrufe.
+echo "docker $*" >> "$FAKE_LOG"
+case "$1 $2" in
+  "compose pull"|"compose up") echo "marker-bei-$1-$2=$([ -e "$MARKER" ] && echo da || echo weg)" >> "$FAKE_LOG" ;;
+esac
+[ "$1" = "cp" ] && echo "marker-bei-cp=$([ -e "$MARKER" ] && echo da || echo weg)" >> "$FAKE_LOG"
+[ "$1" = "cp" ] && [ "${FAKE_FAIL:-}" = "cp" ] && exit 1
+if [ "$1" = "compose" ] && [ "$2" = "config" ]; then printf 'app\nredis\n'; exit 0; fi
+if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "${FAKE_FAIL:-}" = "up" ]; then exit 1; fi
+if [ "$1" = "inspect" ]; then
+  [ "${FAKE_FAIL:-}" = "inspect" ] && exit 1
+  printf '%s\n' "${FAKE_LABEL-}"; exit 0
 fi
-# Reihenfolge: der Vermerk steht NACH Kopieren und Cache-Reset, nicht davor
-APPLY_LINES=$(grep -n -E 'docker cp /tmp/quick-deploy/resources/views|opcache|BASIS_FILE=' "$WORK/apply.sh" | tail -n 1 | cut -d: -f2- | cut -c1-12)
-expect "Quick-Deploy: Vermerk ist die letzte Wirkung (nach cp und OPcache-Reset)" "BASIS_FILE=\"" "$APPLY_LINES"
-expect "Quick-Deploy: images nur mit HAS_IMAGES kopiert" "1" "$(grep -c 'HAS_IMAGES" = "true"' "$WORK/apply.sh")"
+if [ "$1" = "exec" ] && printf '%s ' "$@" | grep -q 'kill -USR2' && [ "${FAKE_USR2_FAIL:-}" = "1" ]; then exit 1; fi
+exit 0
+FAKE
+cat > "$BIN/curl" <<'FAKE'
+#!/bin/bash
+out=""; while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done
+[ -n "$out" ] && echo ok > "$out"
+printf '%s' "${FAKE_CURL_CODE:-200}"
+FAKE
+cat > "$BIN/timeout" <<'FAKE'
+#!/bin/bash
+shift; exec "$@"
+FAKE
+chmod +x "$BIN"/*
 
-# Full-Deploy: Vermerk nach compose_up/Extra-Pfaden, vor dem Aufräumen, nur mit app-container
-INPUT_DEPLOY_PATH="$SERVER/full" INPUT_APP_CONTAINER=app GITHUB_SHA_VALUE="$SHA_VALUE" INPUT_STATEFUL_SERVICES="" INPUT_PRE_DEPLOY_COMMANDS="" INPUT_POST_DEPLOY_COMMANDS="" INPUT_EXTRA_DEPLOY_PATHS="" \
-  "$EXTRACT" "$WF" full-deploy "Deploy to Hetzner" --key script > "$WORK/full.sh" || fail "Extraktion Full-Deploy-Skript"
-if grep -q 'quick-deploy-basis' "$WORK/full.sh"; then
-  L_UP=$(grep -n '^ *compose_up$' "$WORK/full.sh" | tail -n 1 | cut -d: -f1)
-  L_EXTRA=$(grep -n 'Deploying to extra path' "$WORK/full.sh" | cut -d: -f1)
-  L_BASIS=$(grep -n 'quick-deploy-basis.tmp' "$WORK/full.sh" | head -n 1 | cut -d: -f1)
-  L_PRUNE=$(grep -n 'docker image prune' "$WORK/full.sh" | cut -d: -f1)
-  [ -n "$L_BASIS" ] && [ "$L_BASIS" -gt "$L_UP" ] && [ "$L_BASIS" -gt "$L_EXTRA" ] && [ "$L_BASIS" -lt "$L_PRUNE" ] \
-    && ok "Full-Deploy: Vermerk nach compose_up und Extra-Pfaden" || fail "Full-Deploy: Vermerk an falscher Stelle ($L_UP/$L_EXTRA/$L_BASIS/$L_PRUNE)"
-  # Block ausführen (if ... fi)
-  mkdir -p "$SERVER/full"
-  sed -n '/^ *if \[ -n "app" \]; then/,/^ *fi$/p' "$WORK/full.sh" > "$WORK/full-tail.sh"
-  (bash -e "$WORK/full-tail.sh" >/dev/null 2>&1)
-  expect "Full-Deploy schreibt Basis-Vermerk (mit app-container)" "$C4" "$(cat "$SERVER/full/.quick-deploy-basis" 2>/dev/null)"
-  # ohne app-container: nichts schreiben
-  INPUT_DEPLOY_PATH="$SERVER/ohne" INPUT_APP_CONTAINER="" GITHUB_SHA_VALUE="$SHA_VALUE" INPUT_STATEFUL_SERVICES="" INPUT_PRE_DEPLOY_COMMANDS="" INPUT_POST_DEPLOY_COMMANDS="" INPUT_EXTRA_DEPLOY_PATHS="" \
-    "$EXTRACT" "$WF" full-deploy "Deploy to Hetzner" --key script > "$WORK/full-ohne.sh"
-  mkdir -p "$SERVER/ohne"
-  sed -n '/^ *if \[ -n "" \]; then/,/^ *fi$/p' "$WORK/full-ohne.sh" > "$WORK/full-ohne-tail.sh"
-  (bash -e "$WORK/full-ohne-tail.sh" >/dev/null 2>&1)
-  [ ! -e "$SERVER/ohne/.quick-deploy-basis" ] && ok "Full-Deploy ohne app-container: kein Vermerk" || fail "Full-Deploy ohne app-container schreibt Vermerk"
-else
-  fail "Full-Deploy-Skript enthaelt keinen Basis-Vermerk"
-fi
+SHA_VALUE="$C4"
+OTHER="1111111111111111111111111111111111111111"   # Revision eines anderen Laufs im Image-Label
+
+run_quick() { # fail usr2fail curlcode vorhandener-vermerk -> schreibt $SERVER/app, Rueckgabe: exit-Code
+  SERVER="$WORK/server-quick"; rm -rf "$SERVER" "$WORK/qd"; mkdir -p "$SERVER/app" "$WORK/qd/resources/views" "$WORK/qd/lang" "$WORK/qd/public/build" "$WORK/qd/public/images"
+  [ -n "$4" ] && echo "$4" > "$SERVER/app/.quick-deploy-basis"
+  : > "$WORK/fake.log"
+  INPUT_DEPLOY_PATH="$SERVER/app" INPUT_APP_CONTAINER=app INPUT_PUBLIC_VOLUME_PATH="" GITHUB_SHA_VALUE="$SHA_VALUE" \
+    "$EXTRACT" "$WF" quick-deploy "Apply + clear caches" --key script \
+    | sed -e "s|/tmp/quick-deploy|$WORK/qd|g" -e "s|/tmp/opcache-reset.out|$WORK/opcache.out|g" > "$WORK/apply.sh"
+  PATH="$BIN:$PATH" FAKE_LOG="$WORK/fake.log" MARKER="$SERVER/app/.quick-deploy-basis" FAKE_FAIL="$1" FAKE_USR2_FAIL="$2" FAKE_CURL_CODE="$3" \
+    OPCACHE_RESET_URL="https://x.invalid/reset" DEPLOY_TOKEN=t HAS_IMAGES=false \
+    bash -e "$WORK/apply.sh" > "$WORK/apply.out" 2>&1
+}
+marker() { cat "$1/.quick-deploy-basis" 2>/dev/null || echo "-"; }
+
+run_quick "" 0 200 "$C1"; RC=$?
+expect "Quick: Erfolg, Exit 0" "0" "$RC"
+expect "Quick: Vermerk = github.sha nach Erfolg" "$C4" "$(marker "$SERVER/app")"
+expect "Quick: alter Vermerk war vor dem ersten docker cp ungültig" "marker-bei-cp=weg" "$(grep 'marker-bei-cp' "$WORK/fake.log" | head -n 1)"
+[ ! -e "$SERVER/app/.quick-deploy-basis.tmp" ] && ok "Quick: keine .tmp-Datei übrig" || fail "Quick: .tmp-Datei übrig"
+run_quick "" 1 500 "$C1"; RC=$?
+expect "Quick: Reset-URL 500 und USR2 scheitert -> kein Vermerk" "-" "$(marker "$SERVER/app")"
+expect "Quick: ... Lauf bleibt wie bisher grün (Exit 0)" "0" "$RC"
+run_quick "" 0 500 "$C1"; RC=$?
+expect "Quick: Reset-URL 500, USR2 gelingt -> Vermerk" "$C4" "$(marker "$SERVER/app")"
+run_quick cp 0 200 "$C1"; RC=$?
+[ "$RC" -ne 0 ] && ok "Quick: docker cp scheitert -> Lauf rot" || fail "Quick: docker cp scheitert, Lauf nicht rot"
+expect "Quick: ... und der alte Vermerk bleibt NICHT gültig" "-" "$(marker "$SERVER/app")"
+expect "Quick: images nur mit HAS_IMAGES kopiert (Skript)" "1" "$(grep -c 'HAS_IMAGES" = "true"' "$WORK/apply.sh")"
+
+run_full() { # fail label app-container vorhandener-vermerk
+  SERVER="$WORK/server-full"; rm -rf "$SERVER"; mkdir -p "$SERVER/app"
+  [ -n "$4" ] && echo "$4" > "$SERVER/app/.quick-deploy-basis"
+  : > "$WORK/fake.log"
+  INPUT_DEPLOY_PATH="$SERVER/app" INPUT_APP_CONTAINER="$3" GITHUB_SHA_VALUE="$SHA_VALUE" INPUT_STATEFUL_SERVICES="redis" INPUT_PRE_DEPLOY_COMMANDS="" INPUT_POST_DEPLOY_COMMANDS="" INPUT_EXTRA_DEPLOY_PATHS="" \
+    "$EXTRACT" "$WF" full-deploy "Deploy to Hetzner" --key script > "$WORK/full.sh"
+  PATH="$BIN:$PATH" FAKE_LOG="$WORK/fake.log" MARKER="$SERVER/app/.quick-deploy-basis" FAKE_FAIL="$1" FAKE_LABEL="$2" GHCR_TOKEN=x \
+    bash "$WORK/full.sh" > "$WORK/full.out" 2>&1
+}
+
+run_full "" "$C4" app "$C1"; RC=$?
+expect "Full: Erfolg, Exit 0" "0" "$RC"
+expect "Full: Vermerk = Revision aus dem Container-Label" "$C4" "$(marker "$SERVER/app")"
+expect "Full: alter Vermerk war vor docker compose pull ungültig" "marker-bei-compose-pull=weg" "$(grep 'marker-bei-compose-pull' "$WORK/fake.log" | head -n 1)"
+run_full "" "$OTHER" app "$C1"; RC=$?
+expect "Full: Vermerk folgt dem Image-Label, nicht github.sha (fremdes :latest)" "$OTHER" "$(marker "$SERVER/app")"
+run_full "" "" app "$C1"; RC=$?
+expect "Full: Label leer -> kein Vermerk (fail closed)" "-" "$(marker "$SERVER/app")"
+run_full "" "<no value>" app "$C1"; RC=$?
+expect "Full: Label ungültig -> kein Vermerk" "-" "$(marker "$SERVER/app")"
+run_full inspect "$C4" app "$C1"; RC=$?
+expect "Full: docker inspect scheitert -> kein Vermerk" "-" "$(marker "$SERVER/app")"
+run_full up "$C4" app "$C1"; RC=$?
+[ "$RC" -ne 0 ] && ok "Full: compose up scheitert -> Lauf rot" || fail "Full: compose up scheitert, Lauf nicht rot"
+expect "Full: ... und der alte Vermerk bleibt NICHT gültig" "-" "$(marker "$SERVER/app")"
+run_full "" "$C4" "" "$C1"; RC=$?
+expect "Full ohne app-container: vorhandener Vermerk bleibt unberührt" "$C1" "$(marker "$SERVER/app")"
+run_full "" "$C4" "" ""; RC=$?
+expect "Full ohne app-container: kein Vermerk angelegt" "-" "$(marker "$SERVER/app")"
+
+echo "== Build-Label"
+BUILD_LABEL=$(ruby -ryaml -e 'wf=YAML.load_file(ARGV[0]); s=wf["jobs"]["full-deploy"]["steps"].find{|x| x["name"]=="Build and push Docker image"}; puts s["with"]["labels"]' "$WF")
+expect "Build setzt das Revision-Label" "org.opencontainers.image.revision=\${{ github.sha }}" "$(printf '%s' "$BUILD_LABEL" | head -n 1)"
 
 echo "== Ergebnis: $PASS ok, $FAIL fehlend"
 [ "$FAIL" -eq 0 ]

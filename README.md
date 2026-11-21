@@ -121,13 +121,23 @@ für Commit A ab und der Folge-Commit B enthielt nur Views oder `nginx.conf`, ü
 Quick-Deploy von B nur B's Diff: die PHP-Änderungen von A kamen nie an, obwohl `main` grün
 meldete (nickheymann-tall, 76681c7 und e0988ad, 21.11.2026).
 
-Jetzt schreibt jeder erfolgreiche Deploy am Ziel den ausgerollten Commit nach
-`<deploy-path>/.quick-deploy-basis` (Full-Deploy nach compose up, post-deploy-commands und
-Extra-Pfaden; Quick-Deploy nach Kopieren und Cache-Reset; atomar über `.tmp` + `mv`, nur bei
-gesetztem `app-container`). `detect-changes` liest ihn per ssh und diffet `Basis..HEAD`.
-Der Full-Deploy läuft (fail closed), wenn der Vermerk fehlt, kein 40-stelliger SHA ist, nicht
-lesbar ist oder der Basis-Commit nicht abrufbar ist. Folge: der erste Deploy nach der
-Umstellung auf eine Version mit Basis-Vermerk ist immer ein Full-Deploy (Vermerk fehlt noch).
+Jetzt gilt ein Basis-Vermerk am Ziel (`<deploy-path>/.quick-deploy-basis`, nur bei gesetztem
+`app-container`):
+
+- Er wird **vor der ersten Änderung am Ziel gelöscht** (Full-Deploy vor `docker compose pull`,
+  Quick-Deploy vor dem ersten `docker cp`). Bricht ein Lauf ab oder scheitert, bleibt kein
+  veralteter Vermerk gültig.
+- Er wird **erst nach vollständigem Erfolg neu geschrieben** (atomar über `.tmp` + `mv`):
+  Full-Deploy nach compose up, post-deploy-commands und Extra-Pfaden, mit der Revision aus dem
+  Label `org.opencontainers.image.revision` des laufenden App-Containers (der Build setzt es auf
+  `github.sha`), also gebunden an das wirklich gestartete Image und nicht an einen Lauf, dessen
+  `:latest` überschrieben wurde. Quick-Deploy nach Kopieren und gelungenem OPcache-Reset
+  (scheitert der Reset, bleibt der Vermerk weg).
+- `detect-changes` liest ihn per ssh und diffet `Basis..HEAD`. Der Full-Deploy läuft (fail
+  closed), wenn der Vermerk fehlt, kein 40-stelliger SHA ist, nicht lesbar ist oder der
+  Basis-Commit nicht abrufbar ist. Folge: der erste Deploy nach der Umstellung auf eine Version
+  mit Basis-Vermerk ist immer ein Full-Deploy (Vermerk fehlt noch), ebenso der Deploy nach jedem
+  abgebrochenen oder fehlgeschlagenen Lauf.
 
 Eine Wiederholung eines alten Laufs setzt den Vermerk auf dessen Commit zurück (der Stand am
 Ziel ist dann tatsächlich der alte); der nächste Push holt die Differenz nach.
