@@ -737,9 +737,12 @@ jobs:
                   rc=$?
                 fi
                 printf '%s\n' "$out"
-                if ! printf '%s' "$out" | grep -qE 'NotFound: content digest|lease does not exist'; then
-                  return "$rc"
-                fi
+                # Bash-Mustervergleich statt Pipe in grep -q: bei langer Ausgabe bricht grep früh ab,
+                # printf erhält SIGPIPE und pipefail würde den Treffer als "kein Treffer" werten.
+                case "$out" in
+                  *"NotFound: content digest"*|*"lease does not exist"*) ;;
+                  *) return "$rc" ;;
+                esac
                 if [ "$attempt" -ge "$max" ]; then
                   echo "::error::docker compose pull scheiterte $max Mal an fehlendem Inhalt im Image-Speicher (NotFound: content digest). Nichts ausgerollt."
                   return "$rc"
