@@ -122,8 +122,9 @@ nennt im Log die auslösende Datei (`Full build required due to: <datei> (<grund
 - `resources/views/**` (rsync, `docker cp`), `lang/**` (nur wenn `lang/` im Stand existiert)
 - `resources/css/**`, `resources/js/**` (Eingaben des Vite-Builds) und `public/build/**`, jeweils nur
   mit gesetztem `public-volume-path` (nur dann kopiert der Quick-Deploy `public/build` ans Ziel)
-- `public/images/**` nur mit `public-volume-path` und nur Neuanlagen und Änderungen (kopiert wird
-  additiv, Löschungen kämen nicht an)
+- `public/images/**` nur mit `public-volume-path`
+- Nur Neuanlagen und Änderungen: der Quick-Deploy kopiert additiv (`docker cp`, `cp -r`), gelöschte
+  oder umbenannte Dateien blieben am Ziel liegen und führen deshalb immer zum Full-Deploy
 - Alles andere ist Full: `Dockerfile`, `docker/`, `docker-entrypoint.sh`, Compose-Dateien, `scripts/`,
   `resources/` außer views, css und js, `public/` außer build und images, Wurzeldateien, `nginx.conf`
   (wird auch vom Full-Deploy nicht ausgerollt, die Warnung bleibt). Folge: eine reine Doku-Änderung
