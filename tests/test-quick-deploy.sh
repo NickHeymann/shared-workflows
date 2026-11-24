@@ -374,6 +374,7 @@ expect "Full ohne app-container: kein Vermerk angelegt" "-" "$(marker "$SERVER/a
 echo "== Sperre je deploy-path (flock)"
 conc_setup() { # schreibt $WORK/c-apply.sh und $WORK/c-full.sh gegen $SERVER/app
   SERVER="$WORK/server-conc"; rm -rf "$SERVER" "$WORK/qd"; mkdir -p "$SERVER/app" "$WORK/qd/resources/views" "$WORK/qd/lang" "$WORK/qd/public/build" "$WORK/qd/public/images"
+  : > "$DOCKER_LOCK_FILE"   # Sperrdatei gehört dem Prune-Skript und existiert am Server
   echo "$C1" > "$SERVER/app/.quick-deploy-basis"
   : > "$WORK/fake.log"; : > "$WORK/events"; rm -f "$WORK/events.q" "$WORK/state" "$WORK/state.views"
   INPUT_DEPLOY_PATH="$SERVER/app" INPUT_APP_CONTAINER=app INPUT_PUBLIC_VOLUME_PATH="" GITHUB_SHA_VALUE="$SHA_VALUE" \
@@ -591,6 +592,16 @@ conc_env GHCR_TOKEN=x bash "$WORK/d-full.sh" > "$WORK/d-full.out" 2>&1; RC=$?
 expect "Sperrdatei fehlt: Deploy läuft durch (Exit 0)" "0" "$RC"
 grep -q 'Docker-Sperrdatei .* fehlt' "$WORK/d-full.out" && ok "Sperrdatei fehlt: laute Warnung" || fail "Sperrdatei fehlt: keine Warnung"
 [ ! -e "$DOCKER_LOCK_FILE" ] && ok "Sperrdatei fehlt: Deploy hat sie nicht angelegt" || fail "Deploy hat die Sperrdatei angelegt"
+expect "Sperrdatei fehlt: Aufräumen entfällt (kein docker image prune ohne exklusive Sperre)" "0" "$(grep -c '^docker image prune' "$WORK/fake.log")"
+grep -q 'Aufräumen übersprungen' "$WORK/d-full.out" && ok "Sperrdatei fehlt: Aufräumen laut übersprungen" || fail "Sperrdatei fehlt: Aufräumen ohne Meldung"
+# 7b) Fehlschlag nach der Sperre: der Hilfsprozess räumt sein Verzeichnis selbst weg (kein Rest unter TMPDIR)
+dl_setup; mkdir -p "$WORK/leak" "$WORK/mkbin"; rm -rf "$WORK/leak"/*
+# macOS-mktemp ignoriert TMPDIR: Attrappe, die "mktemp -d" in $TMPDIR anlegt
+printf '#!/bin/sh\nexec /usr/bin/mktemp -d "$TMPDIR/tmp.XXXXXX"\n' > "$WORK/mkbin/mktemp"; chmod +x "$WORK/mkbin/mktemp"
+PATH="$WORK/mkbin:$PATH" TMPDIR="$WORK/leak" FAKE_PULL_FAILS=1 FAKE_PULL_MSG="unauthorized: x" conc_env GHCR_TOKEN=x bash "$WORK/d-full.sh" > "$WORK/d-full.out" 2>&1; RC=$?
+perl -e 'select(undef,undef,undef,2.5)'
+[ "$RC" -ne 0 ] && ok "Pull-Fehler nach der Sperre: Deploy rot (Exit $RC)" || fail "Pull-Fehler nach der Sperre: Deploy nicht rot"
+expect "Pull-Fehler nach der Sperre: kein Sperr-Verzeichnis übrig" "0" "$(ls -A "$WORK/leak" | wc -l | tr -d ' ')"
 # 8) Sperrdatei nur lesbar (root 644 am Server, hier 444): flock -s genügt, Deploy läuft
 dl_setup; chmod 444 "$DOCKER_LOCK_FILE"
 conc_env GHCR_TOKEN=x bash "$WORK/d-full.sh" > "$WORK/d-full.out" 2>&1; RC=$?
