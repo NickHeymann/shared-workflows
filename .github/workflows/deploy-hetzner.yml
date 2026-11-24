@@ -1094,6 +1094,11 @@ jobs:
             docker_lock() { # s|x frist-in-sekunden
               local mode="$1" wait_s="$2" ticks=0 max_ticks
               if [ ! -e "$DOCKER_LOCK_FILE" ]; then
+                if [ "$mode" = x ]; then
+                  # Exklusiv (Aufräumen) ohne Sperrdatei nie ungesperrt: das Aufräumen entfällt.
+                  echo "::warning::Docker-Sperrdatei $DOCKER_LOCK_FILE fehlt am Server (wird nicht angelegt): exklusive Sperre nicht möglich."
+                  return 1
+                fi
                 echo "::warning::Docker-Sperrdatei $DOCKER_LOCK_FILE fehlt am Server (wird nicht angelegt). Deploy läuft ohne hostweite Sperre gegen docker prune."
                 return 0
               fi
@@ -1102,7 +1107,7 @@ jobs:
                 return 1
               fi
               DOCKER_LOCK_DIR=$(mktemp -d) || { DOCKER_LOCK_DIR=""; echo "::error::mktemp fehlgeschlagen, Docker-Sperre nicht möglich."; return 1; }
-              flock "-$mode" -w "$wait_s" "$DOCKER_LOCK_FILE" sh -c 'echo gesperrt > "$1/gesperrt" || exit 1; while kill -0 "$2" 2>/dev/null && [ ! -e "$1/frei" ]; do sleep 1; done' sh "$DOCKER_LOCK_DIR" "$$" >/dev/null 2>&1 &
+              flock "-$mode" -w "$wait_s" "$DOCKER_LOCK_FILE" sh -c 'echo gesperrt > "$1/gesperrt" || exit 1; while kill -0 "$2" 2>/dev/null && [ ! -e "$1/frei" ]; do sleep 1; done; rm -rf "$1"' sh "$DOCKER_LOCK_DIR" "$$" >/dev/null 2>&1 &
               DOCKER_LOCK_PID=$!
               max_ticks=$(( (wait_s + 30) * 5 ))
               while [ ! -s "$DOCKER_LOCK_DIR/gesperrt" ]; do
@@ -1408,7 +1413,7 @@ jobs:
               docker image prune -f --filter "until=1h" || echo "::warning::docker image prune fehlgeschlagen (Deploy selbst ist ausgerollt)"
               docker_unlock
             else
-              echo "::warning::Aufräumen übersprungen: Docker-Sperre nicht frei (ein anderer Deploy pullt gerade). Der Deploy selbst ist ausgerollt."
+              echo "::warning::Aufräumen übersprungen: exklusive Docker-Sperre nicht erhalten (ein anderer Deploy pullt gerade oder die Sperrdatei fehlt). Der Deploy selbst ist ausgerollt."
             fi
 
       # Staging-Verzeichnis der Konfigurationsdateien am Ziel auch bei Fehler oder Abbruch entfernen.
