@@ -175,7 +175,21 @@ Jetzt gilt ein Basis-Vermerk am Ziel (`<deploy-path>/.quick-deploy-basis`, nur b
   containerd-Image-Speichers höchstens dreimal im Abstand von 15 Sekunden wiederholt, mit lauter
   Warnung je Versuch und Fehlermeldung nach dem dritten. Ursache ist ein gleichzeitiger
   `docker image prune` auf dem gemeinsamen Server, der die Lease eines laufenden Pulls löscht
-  (moby/moby#53321). Jeder andere Pull-Fehler schlägt sofort fehl.
+  (moby/moby#53321). Als Sicherheitsnetz gilt dasselbe für `failed commit on ref` und
+  `failed to extract layer`, jeweils nur zusammen mit `no such file or directory` (so zeigte sich
+  die Lease-Löschung am 11.11. und 24.11.). Jeder andere Pull-Fehler schlägt sofort fehl.
+- **Hostweite Docker-Sperre** (eigentliche Ursache dieser Fehler): Der Full-Deploy hält
+  `/var/lock/docker-image.lock` **geteilt** (`flock -s`, Frist 300 s) von vor dem Einspielen der
+  Konfigurationsdateien und `docker compose pull` bis nach `compose up`, Post-Deploy-Befehlen und
+  Extra-Pfaden. Das Server-Skript `daily-disk-cleanup.sh` (Cron alle 15 Minuten) und jedes andere
+  Aufräumen (`docker image prune`, `builder prune`) hält sie **exklusiv**. So läuft kein Prune mitten
+  in einem Pull. Ist die Sperre nach 300 s nicht frei, bricht der Deploy laut ab, bevor etwas
+  ausgerollt oder verändert ist. Das Aufräumen am Ende des Deploys gibt die geteilte Sperre frei,
+  nimmt sie exklusiv (60 s) und wird bei Frist mit Warnung übersprungen. Die Sperrdatei gehört dem
+  Prune-Skript: der Deploy legt sie nie an. Fehlt sie, meldet er das laut und läuft ohne hostweite
+  Sperre (dann schützt nur die Wiederholung); ist sie nicht lesbar, bricht er laut ab. Für `flock -s`
+  genügt Leserecht (am Server root, 644). Der Quick-Deploy ist unverändert und hält die Sperre nicht
+  (offener Folgeschritt: sein Pull der Basis-Images im `docker run`).
 - `nginx.conf` wird von keinem der beiden Deploys ausgerollt (am Server von Hand gepflegt). Ändert
   sich die Datei, meldet der Lauf das als Warnung und in der Zusammenfassung, statt sie still als
   ausgerollt zu führen.
