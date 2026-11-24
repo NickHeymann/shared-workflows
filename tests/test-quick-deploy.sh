@@ -432,6 +432,23 @@ expect "Full mit Hintergrundprozess in pre/post-deploy-commands: Exit 0" "0" "$R
 ( exec 9>"$SERVER/app/.deploy.lock"; PATH="$BIN:$PATH" flock -w 4 9 ); RC=$?
 if [ -n "${TEST_NOLOCK:-}" ]; then :; else expect "Sperre ist nach dem Skriptende frei, obwohl ein Hintergrundprozess weiterläuft" "0" "$RC"; fi
 
+# Hook-Kommandos: letzte Zeile eine && Liste mit falscher Bedingung bricht den Deploy nicht ab (wie beim Einsetzen als Skripttext);
+# ein echter Fehler im Hook (false) bricht weiterhin ab; Sonderzeichen und mehrere Zeilen kommen unverändert an
+conc_setup
+genfull "$SERVER/app" "" '[ -f /nicht/vorhanden ] && echo nie' "$WORK/g-hook.sh"
+conc_env GHCR_TOKEN=x bash "$WORK/g-hook.sh" > "$WORK/g-hook.out" 2>&1; RC=$?
+expect "Hook endet mit falscher && Liste: Deploy läuft durch (Exit 0)" "0" "$RC"
+conc_setup
+genfull "$SERVER/app" "" 'echo "a b"; false' "$WORK/g-hook.sh"
+conc_env GHCR_TOKEN=x bash "$WORK/g-hook.sh" > "$WORK/g-hook.out" 2>&1; RC=$?
+expect "Hook mit echtem Fehler (false): Deploy bricht ab (Exit 1)" "1" "$RC"
+conc_setup
+genfull "$SERVER/app" "" "echo 'zeile eins'
+echo \"zeile \$((1+1))\"" "$WORK/g-hook.sh"
+conc_env GHCR_TOKEN=x bash "$WORK/g-hook.sh" > "$WORK/g-hook.out" 2>&1; RC=$?
+expect "Hook mehrzeilig mit Anführungszeichen: Exit 0" "0" "$RC"
+expect "Hook mehrzeilig: beide Zeilen ausgeführt (pre und post)" "4" "$(grep -c '^zeile' "$WORK/g-hook.out")"
+
 # Extra-Pfade werden mitgesperrt
 conc_setup; mkdir -p "$SERVER/staging"
 ( exec 9>"$SERVER/staging/.deploy.lock"; PATH="$BIN:$PATH" flock 9; sleep 4 ) &
