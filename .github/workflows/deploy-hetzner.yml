@@ -1357,8 +1357,11 @@ jobs:
 
             compose_pull
 
+            # Die Hook-Kommandos laufen per eval im selben Skript. Das angehängte `:` hält den Status
+            # gleich wie beim früheren Einsetzen als Skripttext: endet ein Hook mit einer && Liste, deren
+            # Bedingung falsch ist (`[ -f x ] && tu`), bricht set -e nicht ab.
             # Pre-deploy commands (e.g. migrations before up)
-            eval "${IN_PRE_DEPLOY_COMMANDS:-}"
+            eval "${IN_PRE_DEPLOY_COMMANDS:-}"$'\n:'
 
             compose_up
 
@@ -1367,7 +1370,7 @@ jobs:
             fi
 
             # Post-deploy commands (cache, health check, etc.)
-            eval "${IN_POST_DEPLOY_COMMANDS:-}"
+            eval "${IN_POST_DEPLOY_COMMANDS:-}"$'\n:'
 
             # Deploy extra paths (e.g. staging) if specified
             EXTRA_PATHS="${IN_EXTRA_DEPLOY_PATHS:-}"
