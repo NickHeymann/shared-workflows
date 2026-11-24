@@ -210,6 +210,16 @@ Test (Trockenlauf des Shell-Teils gegen ein Attrappen-Repo, loest keinen Deploy 
 `tests/test-quick-deploy.sh` (Voraussetzung: bash, git, ruby). Mit einer älteren Fassung der
 Workflow-Datei als Argument muss er rot werden.
 
+**Ausdrucksgrenze (GitHub, 21000 Zeichen).** Ein `run:`- oder `script:`-Block mit `${{` zählt für
+GitHub als ein Ausdruck; über 21000 Zeichen (nach dem Ausrücken) lehnt GitHub die ganze Datei ab
+(Lauf ohne Jobs, "workflow file issue"), actionlint meldet das nicht. Darum steht im
+ssh-Skript des Full-Deploys kein `${{`: die Werte kommen als `IN_*` über `env:` des Schritts und
+`envs:` der ssh-Action (drone-ssh setzt sie als `export NAME='Wert'`, Einfachklammern maskiert,
+Zeilenumbrüche und Leerzeichen bleiben erhalten). `pre-deploy-commands` und `post-deploy-commands`
+laufen per `eval` im selben Skript. Neue Werte also immer so übergeben, nie als `${{ }}` ins Skript.
+Test: `tests/test-expression-length.sh` (rot ab 21000, Warnung ab 18000; Rotprobe mit der Fassung
+von v1.8.1 muss rot werden).
+
 ## Tooling (on the Mac, ~/.claude/scripts/ci/)
 
 | Script | Purpose |

@@ -949,11 +949,24 @@ jobs:
         env:
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
           EXPECTED_BASE: ${{ needs.detect-changes.outputs.base }}
+          # Werte aus Ausdrücken kommen als Umgebungsvariablen in das Skript (envs unten):
+          # der script-Block enthält keinen Ausdruck, weil GitHub einen Block mit ${{ als EINEN
+          # Ausdruck zählt und bei über 21000 Zeichen die ganze Datei ablehnt (tests/test-expression-length.sh).
+          IN_STATEFUL_SERVICES: ${{ inputs.stateful-services }}
+          IN_DEPLOY_PATH: ${{ inputs.deploy-path }}
+          IN_APP_CONTAINER: ${{ inputs.app-container }}
+          IN_EXTRA_DEPLOY_PATHS: ${{ inputs.extra-deploy-paths }}
+          IN_NGINX_CONFIG_CONTAINER: ${{ inputs.nginx-config-container }}
+          IN_NGINX_CONFIG_FILE: ${{ inputs.nginx-config-file }}
+          IN_PRE_DEPLOY_COMMANDS: ${{ inputs.pre-deploy-commands }}
+          IN_POST_DEPLOY_COMMANDS: ${{ inputs.post-deploy-commands }}
+          IN_CONFIG_HASHES: ${{ needs.detect-changes.outputs.config-hashes }}
+          IN_CFG_STAGE: ${{ env.CFG_STAGE }}
         with:
           host: 46.224.6.69
           username: root
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          envs: GHCR_TOKEN,EXPECTED_BASE
+          envs: GHCR_TOKEN,EXPECTED_BASE,IN_STATEFUL_SERVICES,IN_DEPLOY_PATH,IN_APP_CONTAINER,IN_EXTRA_DEPLOY_PATHS,IN_NGINX_CONFIG_CONTAINER,IN_NGINX_CONFIG_FILE,IN_PRE_DEPLOY_COMMANDS,IN_POST_DEPLOY_COMMANDS,IN_CONFIG_HASHES,IN_CFG_STAGE
           timeout: 30s
           command_timeout: 15m
           script: |
@@ -965,7 +978,7 @@ jobs:
             # neu erzeugen, sonst verlieren Queue-Worker und Scheduler waehrend des
             # Neustarts ihre Verbindung. Der Nutzwert von --force-recreate (frische
             # env_file/Mount-Inhalte, neues :latest) betrifft nur die Anwendungsdienste.
-            STATEFUL_SERVICES="${{ inputs.stateful-services }}"
+            STATEFUL_SERVICES="${IN_STATEFUL_SERVICES:-}"
             STATEFUL_NORM=$(printf '%s' "$STATEFUL_SERVICES" | tr ',\n\r\t' '    ')
             if ! [[ "$STATEFUL_NORM" =~ ^[A-Za-z0-9_.\ -]*$ ]]; then
               echo "::error::stateful-services enthaelt ungueltige Zeichen"
@@ -1136,16 +1149,16 @@ jobs:
               fi
             }
 
-            cd "${{ inputs.deploy-path }}"
+            cd "${IN_DEPLOY_PATH:-}"
 
             # Basis-Vermerk ungültig machen, BEVOR das Ziel verändert wird (nur bei Repos
             # mit Quick-Deploy). Er wird erst nach vollständigem Erfolg neu geschrieben;
             # bricht der Deploy dazwischen ab, fällt der nächste Lauf auf Full-Deploy zurück.
-            if [ -n "${{ inputs.app-container }}" ]; then
+            if [ -n "${IN_APP_CONTAINER:-}" ]; then
               # Sperre für den Hauptpfad UND alle Extra-Pfade, damit auch dort kein Quick- oder
               # Full-Deploy parallel läuft. Die Pfade werden sortiert gesperrt (einheitliche
               # Reihenfolge, kein Verklemmen zweier Läufe mit vertauschten Haupt- und Extra-Pfaden).
-              LOCK_PATHS=$(printf '%s\n%s\n' "${{ inputs.deploy-path }}" "${{ inputs.extra-deploy-paths }}" | xargs -n1 | LC_ALL=C sort -u)
+              LOCK_PATHS=$(printf '%s\n%s\n' "${IN_DEPLOY_PATH:-}" "${IN_EXTRA_DEPLOY_PATHS:-}" | xargs -n1 | LC_ALL=C sort -u)
               for lock_path in $LOCK_PATHS; do
                 if ! acquire_deploy_lock "$lock_path" 300; then
                   exit 1
@@ -1155,18 +1168,18 @@ jobs:
               # (z. B. ein am Server weiterlaufender abgebrochener Deploy) einen anderen Stand
               # ausgerollt als der, auf dem detect-changes entschieden hat, nicht überschreiben.
               CUR_BASIS=""
-              if [ -f "${{ inputs.deploy-path }}/.quick-deploy-basis" ]; then
-                CUR_BASIS=$(head -n 1 "${{ inputs.deploy-path }}/.quick-deploy-basis" | tr -d '[:space:]')
+              if [ -f "${IN_DEPLOY_PATH:-}/.quick-deploy-basis" ]; then
+                CUR_BASIS=$(head -n 1 "${IN_DEPLOY_PATH:-}/.quick-deploy-basis" | tr -d '[:space:]')
               fi
               if printf '%s' "$CUR_BASIS" | grep -qE '^[0-9a-f]{40}$' && [ "$CUR_BASIS" != "${EXPECTED_BASE:-}" ]; then
                 echo "::error::Abbruch: Der Basis-Vermerk am Ziel ($CUR_BASIS) hat sich seit der Prüfung geändert (erwartet: ${EXPECTED_BASE:-keiner}). Ein anderer Deploy war dazwischen. Nichts ausgerollt. Lauf wiederholen."
                 exit 1
               fi
-              rm -f "${{ inputs.deploy-path }}/.quick-deploy-basis" "${{ inputs.deploy-path }}/.quick-deploy-basis".tmp.*
+              rm -f "${IN_DEPLOY_PATH:-}/.quick-deploy-basis" "${IN_DEPLOY_PATH:-}/.quick-deploy-basis".tmp.*
             fi
             # Extra-Pfade bekommen ebenfalls neuen Code: ein eigener Vermerk dort (der Pfad
             # kann auch Hauptpfad eines anderen Deploys sein) darf nicht gültig bleiben.
-            printf '%s\n' "${{ inputs.extra-deploy-paths }}" | while IFS= read -r extra; do
+            printf '%s\n' "${IN_EXTRA_DEPLOY_PATHS:-}" | while IFS= read -r extra; do
               extra=$(echo "$extra" | xargs)
               if [ -n "$extra" ]; then
                 rm -f "$extra/.quick-deploy-basis" "$extra"/.quick-deploy-basis.tmp.*
@@ -1188,11 +1201,11 @@ jobs:
             # Ziel gegen den Commit. Fehler vor compose up: Dateien aus den Sicherungen zurück
             # (EXIT-Trap) und roter Lauf. Ab compose up bleiben die neuen Dateien liegen (die
             # Container laufen mit ihnen), ein Fehler macht den Lauf rot.
-            SERVER_CONFIG_HASHES="${{ needs.detect-changes.outputs.config-hashes }}"
-            NGINX_CONFIG_CONTAINER="${{ inputs.nginx-config-container }}"
-            NGINX_CONFIG_FILE="${{ inputs.nginx-config-file }}"
-            CFG_STAGE="${{ env.CFG_STAGE }}"
-            CONFIG_DIR="${{ inputs.deploy-path }}"
+            SERVER_CONFIG_HASHES="${IN_CONFIG_HASHES:-}"
+            NGINX_CONFIG_CONTAINER="${IN_NGINX_CONFIG_CONTAINER:-}"
+            NGINX_CONFIG_FILE="${IN_NGINX_CONFIG_FILE:-}"
+            CFG_STAGE="${IN_CFG_STAGE:-}"
+            CONFIG_DIR="${IN_DEPLOY_PATH:-}"
             CONFIG_ROLLBACK_LIST=""
             CONFIG_ARMED=0
             config_rollback() {
@@ -1346,7 +1359,7 @@ jobs:
               IFS=',' read -r -a CONFIG_ENTRIES <<< "$SERVER_CONFIG_HASHES"
               trap config_rollback EXIT
               # Ohne Quick-Deploy-Sperre oben (kein app-container) hier die Sperre für den Deploy-Pfad.
-              if [ -z "${{ inputs.app-container }}" ]; then
+              if [ -z "${IN_APP_CONTAINER:-}" ]; then
                 if ! acquire_deploy_lock "$CONFIG_DIR" 300; then
                   exit 1
                 fi
@@ -1359,7 +1372,7 @@ jobs:
             compose_pull
 
             # Pre-deploy commands (e.g. migrations before up)
-            ${{ inputs.pre-deploy-commands }}
+            eval "${IN_PRE_DEPLOY_COMMANDS:-}"
 
             compose_up
 
@@ -1368,10 +1381,10 @@ jobs:
             fi
 
             # Post-deploy commands (cache, health check, etc.)
-            ${{ inputs.post-deploy-commands }}
+            eval "${IN_POST_DEPLOY_COMMANDS:-}"
 
             # Deploy extra paths (e.g. staging) if specified
-            EXTRA_PATHS="${{ inputs.extra-deploy-paths }}"
+            EXTRA_PATHS="${IN_EXTRA_DEPLOY_PATHS:-}"
             if [ -n "$EXTRA_PATHS" ]; then
               echo "$EXTRA_PATHS" | while IFS= read -r path; do
                 path=$(echo "$path" | xargs)
@@ -1390,17 +1403,17 @@ jobs:
             # des laufenden App-Containers (an das tatsächlich gestartete Image gebunden),
             # nicht github.sha; fehlt oder ungültig, bleibt der Vermerk weg (fail closed).
             # Atomar über eine laufbezogene .tmp-Datei. Nur bei Repos mit Quick-Deploy.
-            if [ -n "${{ inputs.app-container }}" ]; then
-              if ! REVISION=$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "${{ inputs.app-container }}"); then
+            if [ -n "${IN_APP_CONTAINER:-}" ]; then
+              if ! REVISION=$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "${IN_APP_CONTAINER:-}"); then
                 REVISION=""
               fi
               if printf '%s' "$REVISION" | grep -qE '^[0-9a-f]{40}$'; then
-                BASIS_TMP="${{ inputs.deploy-path }}/.quick-deploy-basis.tmp.$$"
+                BASIS_TMP="${IN_DEPLOY_PATH:-}/.quick-deploy-basis.tmp.$$"
                 printf '%s\n' "$REVISION" > "$BASIS_TMP"
-                mv "$BASIS_TMP" "${{ inputs.deploy-path }}/.quick-deploy-basis"
+                mv "$BASIS_TMP" "${IN_DEPLOY_PATH:-}/.quick-deploy-basis"
                 echo "Basis-Vermerk: $REVISION"
               else
-                echo "::warning::Image-Revision des Containers ${{ inputs.app-container }} nicht lesbar, kein Basis-Vermerk (nächster Deploy ist ein Full-Deploy)"
+                echo "::warning::Image-Revision des Containers ${IN_APP_CONTAINER:-} nicht lesbar, kein Basis-Vermerk (nächster Deploy ist ein Full-Deploy)"
               fi
             fi
 
