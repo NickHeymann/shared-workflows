@@ -261,16 +261,20 @@ cat > "$BIN/flock" <<'FAKE'
 #!/usr/bin/env python3
 # Attrappe fuer util-linux flock ("flock [-w SEK] FD" und "flock [-w SEK] DATEI BEFEHL..."), weil macOS kein flock hat.
 import fcntl, os, subprocess, sys, time
-a = sys.argv[1:]; w = None
-if a and a[0] == "-w": w = float(a[1]); a = a[2:]
+a = sys.argv[1:]; w = None; mode = fcntl.LOCK_EX
+while a and a[0] in ("-w", "-s", "-x", "-n"):
+    if a[0] == "-w": w = float(a[1]); a = a[2:]
+    elif a[0] == "-s": mode = fcntl.LOCK_SH; a = a[1:]
+    elif a[0] == "-x": mode = fcntl.LOCK_EX; a = a[1:]
+    else: w = 0; a = a[1:]
 if a[0].isdigit():
     fd = int(a[0]); cmd = None
 else:
-    fd = os.open(a[0], os.O_RDWR | os.O_CREAT, 0o644); cmd = a[1:]
+    fd = os.open(a[0], os.O_RDONLY | os.O_CREAT, 0o644); cmd = a[1:]  # wie util-linux flock: nur Leserecht nötig
 end = time.time() + (w if w is not None else 1e9)
 while True:
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, mode | fcntl.LOCK_NB)
         sys.exit(subprocess.call(cmd, close_fds=True) if cmd else 0)
     except OSError:
         if time.time() >= end: sys.exit(1)
@@ -279,6 +283,9 @@ FAKE
 chmod +x "$BIN"/*
 # Rotprobe-Schalter: TEST_NOLOCK=1 entfernt die Sperre aus den Skripten
 nolock() { if [ -n "${TEST_NOLOCK:-}" ]; then sed -E 's/flock -w "\$wait_s" "\$lp\/.deploy.lock" //'; else cat; fi; }
+# Rotprobe-Schalter: TEST_NODOCKERLOCK=1 entfernt die hostweite Docker-Sperre aus dem Deploy
+nodockerlock() { if [ -n "${TEST_NODOCKERLOCK:-}" ]; then sed -E 's/flock "-\$mode" -w "\$wait_s" "\$DOCKER_LOCK_FILE" //'; else cat; fi; }
+export DOCKER_LOCK_FILE="$WORK/docker-image.lock"
 shortwait() { sed -E 's/(acquire_deploy_lock "[^"]*") [0-9]+/\1 1/'; }
 
 SHA_VALUE="$C4"
@@ -328,7 +335,7 @@ run_full() { # fail label app-container vorhandener-vermerk  (FULL_EXTRA: Extra-
   [ -n "${FULL_EXTRA:-}" ] && echo "$C1" > "$SERVER/staging/.quick-deploy-basis"
   : > "$WORK/fake.log"
   INPUT_DEPLOY_PATH="$SERVER/app" INPUT_APP_CONTAINER="$3" GITHUB_SHA_VALUE="$SHA_VALUE" INPUT_STATEFUL_SERVICES="redis" INPUT_PRE_DEPLOY_COMMANDS="" INPUT_POST_DEPLOY_COMMANDS="" INPUT_EXTRA_DEPLOY_PATHS="${FULL_EXTRA:+$SERVER/staging}" \
-    "$EXTRACT" "$WF" full-deploy "Deploy to Hetzner" --key script | nolock > "$WORK/full.sh"
+    "$EXTRACT" "$WF" full-deploy "Deploy to Hetzner" --key script | nolock | nodockerlock > "$WORK/full.sh"
   PATH="$BIN:$PATH" FAKE_LOG="$WORK/fake.log" MARKER="$SERVER/app/.quick-deploy-basis" FAKE_FAIL="$1" FAKE_LABEL="$2" GHCR_TOKEN=x EXPECTED_BASE="${EXP_OVERRIDE-$4}" \
     bash "$WORK/full.sh" > "$WORK/full.out" 2>&1
 }
@@ -367,13 +374,14 @@ expect "Full ohne app-container: kein Vermerk angelegt" "-" "$(marker "$SERVER/a
 echo "== Sperre je deploy-path (flock)"
 conc_setup() { # schreibt $WORK/c-apply.sh und $WORK/c-full.sh gegen $SERVER/app
   SERVER="$WORK/server-conc"; rm -rf "$SERVER" "$WORK/qd"; mkdir -p "$SERVER/app" "$WORK/qd/resources/views" "$WORK/qd/lang" "$WORK/qd/public/build" "$WORK/qd/public/images"
+  : > "$DOCKER_LOCK_FILE"   # Sperrdatei gehört dem Prune-Skript und existiert am Server
   echo "$C1" > "$SERVER/app/.quick-deploy-basis"
   : > "$WORK/fake.log"; : > "$WORK/events"; rm -f "$WORK/events.q" "$WORK/state" "$WORK/state.views"
   INPUT_DEPLOY_PATH="$SERVER/app" INPUT_APP_CONTAINER=app INPUT_PUBLIC_VOLUME_PATH="" GITHUB_SHA_VALUE="$SHA_VALUE" \
     "$EXTRACT" "$WF" quick-deploy "Apply + clear caches" --key script \
     | sed -e "s|/tmp/quick-deploy-RUN-1|$WORK/qd|g" -e "s|/tmp/opcache-reset.out|$WORK/opcache.out|g" | nolock > "$WORK/c-apply.sh"
   INPUT_DEPLOY_PATH="$SERVER/app" INPUT_APP_CONTAINER=app GITHUB_SHA_VALUE="$SHA_VALUE" INPUT_STATEFUL_SERVICES="redis" INPUT_PRE_DEPLOY_COMMANDS="" INPUT_POST_DEPLOY_COMMANDS="" INPUT_EXTRA_DEPLOY_PATHS="" \
-    "$EXTRACT" "$WF" full-deploy "Deploy to Hetzner" --key script | nolock > "$WORK/c-full.sh"
+    "$EXTRACT" "$WF" full-deploy "Deploy to Hetzner" --key script | nolock | nodockerlock > "$WORK/c-full.sh"
 }
 conc_env() { PATH="$BIN:$PATH" FAKE_LOG="$WORK/fake.log" MARKER="$SERVER/app/.quick-deploy-basis" FAKE_EVENTS="$WORK/events" FAKE_STATE="$WORK/state" FAKE_SLEEP=1 FAKE_LABEL="$OTHER" EXPECTED_BASE="$C1" env "$@"; }
 conc_setup
@@ -415,7 +423,7 @@ wait "$PID_H" 2>/dev/null
 # Sperr-Deskriptoren werden nicht an Hintergrundprozesse aus pre-deploy-commands vererbt
 genfull() { # main extra pre -> $WORK/g-full.sh
   INPUT_DEPLOY_PATH="$1" INPUT_APP_CONTAINER=app GITHUB_SHA_VALUE="$SHA_VALUE" INPUT_STATEFUL_SERVICES="redis" INPUT_PRE_DEPLOY_COMMANDS="$3" INPUT_POST_DEPLOY_COMMANDS="$3" INPUT_EXTRA_DEPLOY_PATHS="$2" \
-    "$EXTRACT" "$WF" full-deploy "Deploy to Hetzner" --key script | nolock > "$4"
+    "$EXTRACT" "$WF" full-deploy "Deploy to Hetzner" --key script | nolock | nodockerlock > "$4"
 }
 conc_setup
 genfull "$SERVER/app" "" "sleep 6 &" "$WORK/g-full.sh"
@@ -505,6 +513,108 @@ FAKE_PULL_FAILS=1 FAKE_PULL_LONG=1 PULL_RETRY_WAIT=0 run_full "" "$C4" app "$C1"
 expect "Pull: Fehler steht VOR 600 kB Ausgabe (SIGPIPE-Fall) -> trotzdem Wiederholung, Exit 0" "0" "$RC"
 expect "Pull: ... zwei Versuche" "2" "$(grep -c '^docker compose pull' "$WORK/fake.log")"
 rm -f "$WORK/fake.log.pulln"
+
+# Sicherheitsnetz: dieselbe Lease-Löschung zeigt sich auch als "failed commit on ref" / "failed to extract layer"
+retry_msg() { # name meldung erwartete-versuche
+  rm -f "$WORK/fake.log.pulln"
+  FAKE_PULL_FAILS=1 FAKE_PULL_MSG="$2" PULL_RETRY_WAIT=0 run_full "" "$C4" app "$C1"; RC=$?
+  expect "Pull: $1" "$3" "$(grep -c '^docker compose pull' "$WORK/fake.log")"
+}
+retry_msg "failed commit on ref ... no such file or directory -> wiederholt (zwei Versuche)" 'Error response from daemon: failed commit on ref "index-sha256:7642": commit failed: rename /x/ingest/e0ff/data /x/blobs/sha256/7642: no such file or directory' 2
+retry_msg "failed to extract layer ... no such file or directory -> wiederholt (zwei Versuche)" 'failed to extract layer sha256:abc: rename /x/snapshots/12 /x/snapshots/13: no such file or directory' 2
+retry_msg "failed commit on ref ohne 'no such file' (z. B. falsche Prüfsumme) -> nicht wiederholt" 'failed commit on ref "index-sha256:7642": unexpected commit digest sha256:aaa, expected sha256:bbb' 1
+retry_msg "failed to extract layer ohne 'no such file' (z. B. Platte voll) -> nicht wiederholt" 'failed to extract layer sha256:abc: no space left on device' 1
+rm -f "$WORK/fake.log.pulln"
+
+echo "== Hostweite Docker-Sperre (Prune gegen Pull)"
+dl_setup() { # schreibt $WORK/d-full.sh (Full-Deploy) gegen $SERVER/app; die Sperrdatei gehört dem Prune-Skript und existiert
+  conc_setup; : > "$DOCKER_LOCK_FILE"; rm -f "$WORK/events.s"
+  genfull "$SERVER/app" "" "" "$WORK/d-full.sh"
+}
+# Attrappe eines Prune-Skripts auf dem Server: Prune nur unter exklusiver Sperre, Ereignisse in der Reihenfolge
+pruner() { # frist-sek dauer-sek -> Exit 0 = gelaufen, 1 = übersprungen
+  PATH="$BIN:$PATH" flock -x -w "$1" "$DOCKER_LOCK_FILE" sh -c "echo prune-start >> '$WORK/events'; sleep $2; echo prune-end >> '$WORK/events'"
+}
+# 1) Prune läuft zuerst: der Deploy darf seinen Pull erst nach dem Ende des Prunes beginnen
+dl_setup
+( pruner 30 3; echo $? > "$WORK/p.rc" ) &
+PID_P=$!
+sleep 0.6
+conc_env GHCR_TOKEN=x bash "$WORK/d-full.sh" > "$WORK/d-full.out" 2>&1; RC=$?
+wait "$PID_P"
+expect "Prune zuerst: Deploy wartet, bis der Prune fertig ist (Reihenfolge der Ereignisse)" "prune-start prune-end full-start" "$(grep -E 'prune-start|prune-end|full-start' "$WORK/events" | tr '\n' ' ' | sed 's/ $//')"
+expect "Prune zuerst: Deploy gelingt danach (Exit 0)" "0" "$RC"
+# 2) Deploy zieht gerade: ein Prune muss warten und wird nach Frist übersprungen
+dl_setup
+( FAKE_SLEEP=4 conc_env GHCR_TOKEN=x bash "$WORK/d-full.sh" > "$WORK/d-full.out" 2>&1; echo $? > "$WORK/d.rc" ) &
+PID_D=$!
+sleep 1.2
+pruner 1 1; PRC=$?
+wait "$PID_D"
+expect "Deploy zieht: gleichzeitiger Prune wird nach Frist übersprungen (Exit 1, lief nicht)" "1" "$PRC"
+expect "Deploy zieht: im Ereignisprotokoll steht kein Prune" "0" "$(grep -c 'prune-start' "$WORK/events")"
+expect "Deploy zieht: Deploy selbst gelingt (Exit 0)" "0" "$(cat "$WORK/d.rc")"
+# 3) Nach dem Deploy ist die Sperre frei: ein Prune läuft sofort
+pruner 2 0; expect "Nach dem Deploy: Sperre frei, Prune läuft" "0" "$?"
+# 4) Anderer Deploy hält die Sperre geteilt: das Aufräumen am Ende wird übersprungen, der Deploy bleibt grün
+dl_setup
+( exec 9>"$DOCKER_LOCK_FILE"; PATH="$BIN:$PATH" flock -s 9; sleep 10 ) &
+PID_S=$!
+sleep 0.5
+sed -E 's/docker_lock x 60/docker_lock x 1/' "$WORK/d-full.sh" > "$WORK/d-full-kurz.sh"
+conc_env GHCR_TOKEN=x bash "$WORK/d-full-kurz.sh" > "$WORK/d-full.out" 2>&1; RC=$?
+if [ -n "${TEST_NODOCKERLOCK:-}" ]; then fail "Aufräumen unter fremder geteilter Sperre (ohne Sperre nicht prüfbar)"; else
+expect "Fremde geteilte Sperre: Deploy bleibt grün (Exit 0)" "0" "$RC"
+grep -q 'Aufräumen übersprungen' "$WORK/d-full.out" && ok "Fremde geteilte Sperre: laute Meldung, Aufräumen übersprungen" || fail "Fremde geteilte Sperre: keine Meldung"
+expect "Fremde geteilte Sperre: kein docker image prune" "0" "$(grep -c '^docker image prune' "$WORK/fake.log")"
+fi
+kill "$PID_S" 2>/dev/null; wait "$PID_S" 2>/dev/null
+# 5) Ohne fremden Halter räumt der Deploy selbst auf (unter exklusiver Sperre)
+dl_setup
+conc_env GHCR_TOKEN=x bash "$WORK/d-full.sh" > "$WORK/d-full.out" 2>&1; RC=$?
+expect "Aufräumen am Ende läuft, wenn die Sperre frei ist" "1" "$(grep -c '^docker image prune' "$WORK/fake.log")"
+expect "Deploy gibt die Sperre am Ende frei (Prune sofort möglich)" "0" "$(pruner 2 0; echo $?)"
+# 6) Prune hält die Sperre länger als die Frist des Deploys: Deploy bricht laut ab, nichts ausgerollt
+dl_setup
+sed -E 's/docker_lock s 300/docker_lock s 1/' "$WORK/d-full.sh" > "$WORK/d-full-kurz.sh"
+( pruner 30 4 ) &
+PID_P=$!
+sleep 0.6
+conc_env GHCR_TOKEN=x bash "$WORK/d-full-kurz.sh" > "$WORK/d-full.out" 2>&1; RC=$?
+wait "$PID_P"
+if [ -n "${TEST_NODOCKERLOCK:-}" ]; then fail "Deploy-Frist gegen langen Prune (ohne Sperre nicht prüfbar)"; else
+[ "$RC" -ne 0 ] && grep -q 'Docker-Sperre (geteilt) nicht erhalten' "$WORK/d-full.out" && ok "Langer Prune: Deploy bricht laut ab (Exit $RC)" || fail "Langer Prune: Deploy ohne lauten Abbruch (Exit $RC)"
+expect "Langer Prune: nichts ausgerollt (kein compose pull)" "0" "$(grep -c 'compose pull' "$WORK/fake.log")"
+fi
+# 7) Sperrdatei fehlt: der Deploy legt sie NICHT an, meldet es laut und läuft weiter
+dl_setup; rm -f "$DOCKER_LOCK_FILE"
+conc_env GHCR_TOKEN=x bash "$WORK/d-full.sh" > "$WORK/d-full.out" 2>&1; RC=$?
+expect "Sperrdatei fehlt: Deploy läuft durch (Exit 0)" "0" "$RC"
+grep -q 'Docker-Sperrdatei .* fehlt' "$WORK/d-full.out" && ok "Sperrdatei fehlt: laute Warnung" || fail "Sperrdatei fehlt: keine Warnung"
+[ ! -e "$DOCKER_LOCK_FILE" ] && ok "Sperrdatei fehlt: Deploy hat sie nicht angelegt" || fail "Deploy hat die Sperrdatei angelegt"
+expect "Sperrdatei fehlt: Aufräumen entfällt (kein docker image prune ohne exklusive Sperre)" "0" "$(grep -c '^docker image prune' "$WORK/fake.log")"
+grep -q 'Aufräumen übersprungen' "$WORK/d-full.out" && ok "Sperrdatei fehlt: Aufräumen laut übersprungen" || fail "Sperrdatei fehlt: Aufräumen ohne Meldung"
+# 7b) Fehlschlag nach der Sperre: der Hilfsprozess räumt sein Verzeichnis selbst weg (kein Rest unter TMPDIR)
+dl_setup; mkdir -p "$WORK/leak" "$WORK/mkbin"; rm -rf "$WORK/leak"/*
+# macOS-mktemp ignoriert TMPDIR: Attrappe, die "mktemp -d" in $TMPDIR anlegt
+printf '#!/bin/sh\nexec /usr/bin/mktemp -d "$TMPDIR/tmp.XXXXXX"\n' > "$WORK/mkbin/mktemp"; chmod +x "$WORK/mkbin/mktemp"
+PATH="$WORK/mkbin:$PATH" TMPDIR="$WORK/leak" FAKE_PULL_FAILS=1 FAKE_PULL_MSG="unauthorized: x" conc_env GHCR_TOKEN=x bash "$WORK/d-full.sh" > "$WORK/d-full.out" 2>&1; RC=$?
+perl -e 'select(undef,undef,undef,2.5)'
+[ "$RC" -ne 0 ] && ok "Pull-Fehler nach der Sperre: Deploy rot (Exit $RC)" || fail "Pull-Fehler nach der Sperre: Deploy nicht rot"
+expect "Pull-Fehler nach der Sperre: kein Sperr-Verzeichnis übrig" "0" "$(ls -A "$WORK/leak" | wc -l | tr -d ' ')"
+# 8) Sperrdatei nur lesbar (root 644 am Server, hier 444): flock -s genügt, Deploy läuft
+dl_setup; chmod 444 "$DOCKER_LOCK_FILE"
+conc_env GHCR_TOKEN=x bash "$WORK/d-full.sh" > "$WORK/d-full.out" 2>&1; RC=$?
+expect "Sperrdatei nur lesbar: geteilte Sperre genügt, Deploy gelingt (Exit 0)" "0" "$RC"
+chmod 644 "$DOCKER_LOCK_FILE"
+# 9) Sperrdatei nicht lesbar: lauter Abbruch vor dem Ausrollen (nicht prüfbar als root)
+if [ "$(id -u)" != 0 ]; then
+  dl_setup; chmod 000 "$DOCKER_LOCK_FILE"
+  conc_env GHCR_TOKEN=x bash "$WORK/d-full.sh" > "$WORK/d-full.out" 2>&1; RC=$?
+  [ "$RC" -ne 0 ] && grep -q 'nicht lesbar' "$WORK/d-full.out" && ok "Sperrdatei nicht lesbar: lauter Abbruch (Exit $RC)" || fail "Sperrdatei nicht lesbar: kein Abbruch (Exit $RC)"
+  expect "Sperrdatei nicht lesbar: nichts ausgerollt" "0" "$(grep -c 'compose pull' "$WORK/fake.log")"
+  chmod 644 "$DOCKER_LOCK_FILE"
+fi
 
 echo "== Build-Label"
 BUILD_LABEL=$(ruby -ryaml -e 'wf=YAML.load_file(ARGV[0]); s=wf["jobs"]["full-deploy"]["steps"].find{|x| x["name"]=="Build and push Docker image"}; puts s["with"]["labels"]' "$WF")
